@@ -13,7 +13,7 @@
 사용법
   python naver_report.py                       # 최근 14일(어제까지) 재조회 → 시트 덮어쓰기
   python naver_report.py --since 2026-09-01 --until 2026-09-22
-  python naver_report.py --list-accounts       # 권한 위임받은 광고주 계정 목록
+  python naver_report.py --list-accounts       # 계정별 접근·캠페인 조회 확인
 """
 import argparse
 import base64
@@ -32,7 +32,7 @@ import requests
 
 BASE_URL = "https://api.naver.com"
 KST = timezone(timedelta(hours=9))
-LOOKBACK_DAYS = 20  # 계정의 전환 기여 기간 설정에 맞춰 조정
+LOOKBACK_DAYS = 14  # 계정의 전환 기여 기간 설정에 맞춰 조정
 STAT_FIELDS = ["impCnt", "clkCnt", "salesAmt", "avgRnk", "ccnt", "convAmt"]
 
 
@@ -82,20 +82,17 @@ def api_get(uri, customer_id, params=None, max_retry=5):
 
 
 # ───────────────────────── 수집 ─────────────────────────
-def list_accounts():
-    print("\n[접근 가능한 광고주 계정]")
-    print(f"  {OWNER_ID}  (키 발급 계정)")
-    try:
-        links = api_get("/customer-links", OWNER_ID, {"type": "MYCLIENTS"})
-    except Exception as e:
-        print(f"  권한 위임 목록 조회 실패: {e}")
-        return
-    if not links:
-        print("  위임받은 계정 없음")
-    for c in links:
-        cid = c.get("clientCustomerId") or c.get("customerId")
-        name = c.get("clientLoginId") or c.get("clientName") or c.get("name") or ""
-        print(f"  {cid}  {name}")
+def check_accounts(targets):
+    """계정별로 API 접근과 캠페인 조회가 되는지 확인"""
+    print("\n[계정 접근 확인]")
+    for cid in targets:
+        try:
+            camps = api_get("/ncc/campaigns", cid)
+            print(f"  ✓ {cid}: 캠페인 {len(camps)}개")
+            for c in camps[:10]:
+                print(f"      - {c.get('name')} ({c.get('campaignTp')})")
+        except Exception as e:
+            print(f"  ✗ {cid}: {e}")
 
 
 def get_campaigns(customer_id):
@@ -226,13 +223,12 @@ def main():
     p.add_argument("--list-accounts", action="store_true")
     args = p.parse_args()
 
-    if args.list_accounts:
-        list_accounts()
-        return
-
     since = args.since or (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
     until = args.until or (args.since if args.since else (today - timedelta(days=1)).isoformat())
     targets = [c.strip() for c in get_env("NAVER_CUSTOMER_IDS", required=False, default=OWNER_ID).split(",") if c.strip()]
+    if args.list_accounts:
+        check_accounts(targets)
+        return
     print(f"기간 {since} ~ {until} / 계정 {len(targets)}개")
 
     rows, done, failed = [], set(), []
