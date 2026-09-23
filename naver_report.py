@@ -32,7 +32,7 @@ import requests
 
 BASE_URL = "https://api.naver.com"
 KST = timezone(timedelta(hours=9))
-LOOKBACK_DAYS = 14  # 계정의 전환 기여 기간 설정에 맞춰 조정
+LOOKBACK_DAYS = 20  # 계정의 전환 기여 기간 설정에 맞춰 조정
 STAT_FIELDS = ["impCnt", "clkCnt", "salesAmt", "avgRnk", "ccnt", "convAmt"]
 
 
