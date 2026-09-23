@@ -1,0 +1,54 @@
+name: Meta Ads Daily Report
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 매일 08:00 KST (UTC 23:00). 실제 실행은 수~수십 분 늦을 수 있음
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "시작일 (YYYY-MM-DD, 비우면 어제)"
+        required: false
+      until:
+        description: "종료일 (YYYY-MM-DD, 비우면 시작일과 동일)"
+        required: false
+      list_actions:
+        description: "action_type 목록 출력"
+        type: boolean
+        default: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch Meta insights
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_ACCOUNT_IDS: ${{ secrets.META_ACCOUNT_IDS }}
+          IN_SINCE: ${{ inputs.since }}
+          IN_UNTIL: ${{ inputs.until }}
+          IN_LIST: ${{ inputs.list_actions }}
+        run: |
+          ARGS=()
+          [ -n "$IN_SINCE" ] && ARGS+=(--since "$IN_SINCE")
+          [ -n "$IN_UNTIL" ] && ARGS+=(--until "$IN_UNTIL")
+          [ "$IN_LIST" = "true" ] && ARGS+=(--list-actions)
+          python meta_report.py "${ARGS[@]}"
+
+      - name: Upload CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
