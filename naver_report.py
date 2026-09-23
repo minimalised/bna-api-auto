@@ -83,16 +83,18 @@ def api_get(uri, customer_id, params=None, max_retry=5):
 
 # ───────────────────────── 수집 ─────────────────────────
 def check_accounts(targets):
-    """계정별로 API 접근과 캠페인 조회가 되는지 확인"""
+    """발급 계정과 대상 계정별로 API 접근·캠페인 조회 확인"""
     print("\n[계정 접근 확인]")
-    for cid in targets:
+    checks = [("발급 계정 (NAVER_CUSTOMER_ID)", OWNER_ID)]
+    checks += [(f"대상 {i} (NAVER_CUSTOMER_IDS)", c) for i, c in enumerate(targets, 1) if c != OWNER_ID]
+    for label, cid in checks:
         try:
             camps = api_get("/ncc/campaigns", cid)
-            print(f"  ✓ {cid}: 캠페인 {len(camps)}개")
+            print(f"  ✓ {label}: 캠페인 {len(camps)}개")
             for c in camps[:10]:
                 print(f"      - {c.get('name')} ({c.get('campaignTp')})")
         except Exception as e:
-            print(f"  ✗ {cid}: {e}")
+            print(f"  ✗ {label}: {e}")
 
 
 def get_campaigns(customer_id):
@@ -100,16 +102,45 @@ def get_campaigns(customer_id):
     return {c["nccCampaignId"]: c for c in data}
 
 
-def get_stats(customer_id, ids, day):
+STAT_MODE = {"mode": None}  # "batch"(쉼표 일괄) 또는 "single"(캠페인별)
+SKIPPED = set()
+
+
+def get_stats(customer_id, ids, day, names):
+    fields = json.dumps(STAT_FIELDS)
+    time_range = json.dumps({"since": day, "until": day})
+
+    if STAT_MODE["mode"] in (None, "batch"):
+        try:
+            out = []
+            for i in range(0, len(ids), 100):
+                res = api_get("/stats", customer_id, {
+                    "ids": ",".join(ids[i:i + 100]), "fields": fields, "timeRange": time_range,
+                })
+                out.extend(res.get("data", []))
+            STAT_MODE["mode"] = "batch"
+            return out
+        except RuntimeError as e:
+            if "11001" not in str(e) or STAT_MODE["mode"] == "batch":
+                raise
+            print("  일괄 조회 형식 불가 → 캠페인별 조회로 전환")
+            STAT_MODE["mode"] = "single"
+
     out = []
-    for i in range(0, len(ids), 100):
-        chunk = ids[i:i + 100]
-        res = api_get("/stats", customer_id, {
-            "ids": json.dumps(chunk),
-            "fields": json.dumps(STAT_FIELDS),
-            "timeRange": json.dumps({"since": day, "until": day}),
-        })
-        out.extend(res.get("data", []))
+    for cid in ids:
+        if cid in SKIPPED:
+            continue
+        try:
+            res = api_get("/stats", customer_id, {"id": cid, "fields": fields, "timeRange": time_range})
+        except RuntimeError as e:
+            if "11001" in str(e):
+                SKIPPED.add(cid)
+                print(f"  - 통계 조회 불가, 건너뜀: {names.get(cid, '')} ({cid})")
+                continue
+            raise
+        for d in res.get("data", []):
+            d.setdefault("id", cid)
+            out.append(d)
     return out
 
 
@@ -135,7 +166,8 @@ def fetch_account(customer_id, since, until):
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     rows = []
     for day in daterange(since, until):
-        for s in get_stats(customer_id, ids, day):
+        names = {k: v.get("name", "") for k, v in campaigns.items()}
+        for s in get_stats(customer_id, ids, day, names):
             imp, clk = int(num(s.get("impCnt"))), int(num(s.get("clkCnt")))
             cost, conv, val = round(num(s.get("salesAmt"))), num(s.get("ccnt")), round(num(s.get("convAmt")))
             if not (imp or cost or conv):
