@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Meta Ads 인사이트 → CSV 리포트 (GitHub Actions용)
+Meta Ads 인사이트 → 구글 시트 적재 (최근 N일 upsert) + CSV 백업
 
 환경변수
   META_ACCESS_TOKEN  : 시스템 유저 토큰 (필수)
   META_ACCOUNT_IDS   : 광고계정 ID, 쉼표 구분. act_ 생략 가능 (필수)
+  GCP_SA_KEY         : 서비스 계정 JSON 키 내용 (시트 적재 시 필수)
+  SHEET_ID           : 구글 시트 ID (없으면 CSV만 저장)
+  SHEET_TAB          : 적재할 탭 이름 (기본 meta_daily)
   META_API_VERSION   : 기본 v24.0
 
 사용법
-  python meta_report.py                          # 어제(KST) 데이터
-  python meta_report.py --since 2026-09-01 --until 2026-09-22
-  python meta_report.py --list-actions           # 계정에 실제로 잡히는 action_type 확인
+  python meta_report.py                          # 최근 7일(어제까지) 재조회 → 시트 덮어쓰기
+  python meta_report.py --since 2026-09-01 --until 2026-09-22   # 과거 기간 백필
+  python meta_report.py --list-actions           # 실제 action_type 확인
 """
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -26,9 +30,10 @@ import requests
 API_VERSION = os.getenv("META_API_VERSION", "v24.0")
 BASE_URL = f"https://graph.facebook.com/{API_VERSION}"
 KST = timezone(timedelta(hours=9))
+LOOKBACK_DAYS = 7  # 7일 클릭 어트리뷰션 소급 반영 기간
 
 # 리포트에 넣을 전환 이벤트 (컬럼명: action_type)
-# 계정마다 실제 값이 다를 수 있으니 --list-actions 결과를 보고 수정하세요.
+# --list-actions 결과를 보고 광고관리자 숫자와 맞는 이름으로 수정하세요.
 CONVERSIONS = {
     "구매": "offsite_conversion.fb_pixel_purchase",
     "장바구니": "offsite_conversion.fb_pixel_add_to_cart",
@@ -45,13 +50,14 @@ FIELDS = [
     "spend", "cpm", "actions", "action_values",
 ]
 
-# 호출 제한·일시 오류 → 재시도
 RETRY_CODES = {1, 2, 4, 17, 32, 613, 80000, 80003, 80004}
+ZERO_DECIMAL = {"KRW", "JPY", "VND", "TWD", "CLP", "ISK", "HUF"}
 
 
-def get_env(name):
+# ───────────────────────── Meta API ─────────────────────────
+def get_env(name, required=True):
     value = os.getenv(name, "").strip()
-    if not value:
+    if required and not value:
         sys.exit(f"[오류] 환경변수 {name} 가 비어 있습니다.")
     return value
 
@@ -88,8 +94,8 @@ def fetch_insights(account_id, token, since, until):
         "access_token": token,
         "level": "campaign",
         "fields": ",".join(FIELDS),
-        "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "time_increment": 1,  # 일자별
+        "time_range": json.dumps({"since": since, "until": until}),
+        "time_increment": 1,
         "action_attribution_windows": '["7d_click","1d_view"]',
         "limit": 500,
     }
@@ -98,10 +104,11 @@ def fetch_insights(account_id, token, since, until):
         data = api_get(url, params)
         rows.extend(data.get("data", []))
         url = data.get("paging", {}).get("next")
-        params = None  # next URL에 파라미터가 이미 포함됨
+        params = None
     return rows
 
 
+# ───────────────────────── 가공 ─────────────────────────
 def num(value, cast=float):
     try:
         return cast(float(value))
@@ -109,17 +116,14 @@ def num(value, cast=float):
         return cast(0)
 
 
+def money(value, currency):
+    return round(value) if currency in ZERO_DECIMAL else round(value, 2)
+
+
 def pick(action_list, action_type):
     if not action_list:
         return 0.0
     return sum(num(a.get("value")) for a in action_list if a.get("action_type") == action_type)
-
-
-ZERO_DECIMAL = {"KRW", "JPY", "VND", "TWD", "CLP", "ISK", "HUF"}
-
-
-def money(value, currency):
-    return round(value) if currency in ZERO_DECIMAL else round(value, 2)
 
 
 def build_row(d):
@@ -131,9 +135,9 @@ def build_row(d):
 
     row = {
         "날짜": d.get("date_start"),
-        "계정ID": d.get("account_id"),
+        "계정ID": str(d.get("account_id") or ""),
         "계정명": d.get("account_name"),
-        "캠페인ID": d.get("campaign_id"),
+        "캠페인ID": str(d.get("campaign_id") or ""),
         "캠페인명": d.get("campaign_name"),
         "통화": cur,
         "노출수": num(d.get("impressions"), int),
@@ -150,6 +154,7 @@ def build_row(d):
     row["구매가치"] = money(purchase_value, cur)
     row["ROAS(%)"] = round(purchase_value / spend * 100, 1) if spend else 0
     row["구매CPA"] = money(spend / purchases, cur) if purchases else 0
+    row["수집시각"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     return row
 
 
@@ -161,6 +166,47 @@ def list_actions(raw_rows):
     print("\n[action_type 목록] (합계 내림차순)")
     for k, v in sorted(counts.items(), key=lambda x: -x[1]):
         print(f"  {v:>12,.0f}  {k}")
+
+
+# ───────────────────────── 구글 시트 ─────────────────────────
+def upsert_sheet(new_rows, since, until, done_accounts):
+    """기간(since~until) × 성공한 계정의 기존 행을 지우고 새 행으로 교체"""
+    import gspread
+
+    key = json.loads(get_env("GCP_SA_KEY"))
+    gc = gspread.service_account_from_dict(key)
+    sh = gc.open_by_key(get_env("SHEET_ID"))
+    tab = os.getenv("SHEET_TAB", "meta_daily").strip() or "meta_daily"
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=30)
+
+    values = ws.get_values(value_render_option="UNFORMATTED_VALUE")
+    old_header = values[0] if values else []
+    old_rows = [dict(zip(old_header, v)) for v in values[1:]] if values else []
+
+    done_ids = {a.replace("act_", "") for a in done_accounts}
+    kept = [
+        r for r in old_rows
+        if not (since <= str(r.get("날짜", "")) <= until and str(r.get("계정ID", "")) in done_ids)
+    ]
+    removed = len(old_rows) - len(kept)
+
+    # 컬럼이 바뀌어도(전환 추가 등) 새 헤더 기준으로 재정렬
+    header = list(new_rows[0].keys()) if new_rows else old_header
+    for h in old_header:
+        if h and h not in header:
+            header.append(h)
+
+    merged = kept + new_rows
+    merged.sort(key=lambda r: (str(r.get("날짜", "")), num(r.get("광고비"))), reverse=True)
+
+    out = [header] + [[r.get(h, "") for h in header] for r in merged]
+    ws.resize(rows=max(len(out), 2), cols=max(len(header), 1))
+    ws.update(out, "A1", value_input_option="RAW")
+    ws.freeze(rows=1)
+    print(f"\n시트 적재 완료: '{tab}' 탭 / 교체 {removed}행 → 신규 {len(new_rows)}행 / 전체 {len(merged)}행")
 
 
 def write_summary(rows, since, until):
@@ -183,25 +229,31 @@ def write_summary(rows, since, until):
         f.write("\n".join(lines) + "\n")
 
 
+# ───────────────────────── 실행 ─────────────────────────
 def main():
-    yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = datetime.now(KST).date()
+    default_until = (today - timedelta(days=1)).isoformat()
+    default_since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+
     p = argparse.ArgumentParser()
-    p.add_argument("--since", default=yesterday)
+    p.add_argument("--since", default=None)
     p.add_argument("--until", default=None)
     p.add_argument("--list-actions", action="store_true")
     args = p.parse_args()
-    since, until = args.since, args.until or args.since
+    since = args.since or default_since
+    until = args.until or (args.since if args.since else default_until)
 
     token = get_env("META_ACCESS_TOKEN")
     accounts = [normalize_account(a) for a in get_env("META_ACCOUNT_IDS").split(",") if a.strip()]
     print(f"기간 {since} ~ {until} / 계정 {len(accounts)}개 / API {API_VERSION}")
 
-    raw_all, rows, failed = [], [], []
+    raw_all, rows, done, failed = [], [], [], []
     for acc in accounts:
         try:
             raw = fetch_insights(acc, token, since, until)
             raw_all.extend(raw)
             rows.extend(build_row(d) for d in raw)
+            done.append(acc)
             print(f"  ✓ {acc}: {len(raw)}행")
         except Exception as e:
             failed.append(acc)
@@ -218,10 +270,13 @@ def main():
             w = csv.DictWriter(f, fieldnames=rows[0].keys())
             w.writeheader()
             w.writerows(rows)
-        print(f"\n저장 완료: {out} ({len(rows)}행)")
+        print(f"\nCSV 저장: {out} ({len(rows)}행)")
         write_summary(rows, since, until)
-    else:
-        print("\n저장할 데이터가 없습니다.")
+
+    if get_env("SHEET_ID", required=False) and done:
+        upsert_sheet(rows, since, until, done)
+    elif not get_env("SHEET_ID", required=False):
+        print("SHEET_ID 없음 → 시트 적재 건너뜀")
 
     if failed:
         sys.exit(f"실패 계정: {', '.join(failed)}")
