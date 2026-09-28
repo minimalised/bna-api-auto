@@ -159,9 +159,10 @@ def num(v):
 
 
 def fetch_account(customer_id, since, until):
+    """(행 목록, 이 계정의 캠페인ID 집합) 반환"""
     campaigns = get_campaigns(customer_id)
     if not campaigns:
-        return []
+        return [], set()
     ids = list(campaigns)
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     rows = []
@@ -175,29 +176,23 @@ def fetch_account(customer_id, since, until):
             c = campaigns.get(s.get("id"), {})
             rows.append({
                 "날짜": day,
-                "계정ID": str(customer_id),
-                "계정명": str(customer_id),
                 "캠페인ID": s.get("id"),
                 "캠페인명": c.get("name", ""),
                 "캠페인유형": c.get("campaignTp", ""),
                 "통화": "KRW",
                 "노출수": imp,
                 "클릭수": clk,
-                "CTR(%)": round(clk / imp * 100, 2) if imp else 0,
                 "광고비": cost,
-                "CPC": round(cost / clk) if clk else 0,
                 "평균순위": round(num(s.get("avgRnk")), 1),
                 "전환수": int(conv),
                 "전환가치": val,
-                "ROAS(%)": round(val / cost * 100, 1) if cost else 0,
-                "CPA": round(cost / conv) if conv else 0,
                 "수집시각": now,
             })
-    return rows
+    return rows, set(ids)
 
 
 # ───────────────────────── 시트 ─────────────────────────
-def upsert_sheet(new_rows, since, until, done_ids):
+def upsert_sheet(new_rows, since, until, done_campaign_ids):
     import gspread
 
     gc = gspread.service_account_from_dict(json.loads(get_env("GCP_SA_KEY")))
@@ -212,13 +207,11 @@ def upsert_sheet(new_rows, since, until, done_ids):
     old_header = values[0] if values else []
     old_rows = [dict(zip(old_header, v)) for v in values[1:]] if values else []
     kept = [r for r in old_rows
-            if not (since <= str(r.get("날짜", "")) <= until and str(r.get("계정ID", "")) in done_ids)]
+            if not (since <= str(r.get("날짜", "")) <= until and str(r.get("캠페인ID", "")) in done_campaign_ids)]
     removed = len(old_rows) - len(kept)
 
+    # 새 컬럼 구성만 사용 → 기존 시트에 남아 있던 삭제 컬럼(계정ID, CTR 등)도 같이 정리됨
     header = list(new_rows[0].keys()) if new_rows else old_header
-    for h in old_header:
-        if h and h not in header:
-            header.append(h)
     merged = kept + new_rows
     merged.sort(key=lambda r: (str(r.get("날짜", "")), num(r.get("광고비"))), reverse=True)
     out = [header] + [[r.get(h, "") for h in header] for r in merged]
@@ -228,15 +221,16 @@ def upsert_sheet(new_rows, since, until, done_ids):
     print(f"\n시트 적재 완료: '{tab}' 탭 / 교체 {removed}행 → 신규 {len(new_rows)}행 / 전체 {len(merged)}행")
 
 
-def write_summary(rows, since, until):
+def write_summary(rows_by_account, since, until):
     path = os.getenv("GITHUB_STEP_SUMMARY")
-    if not path or not rows:
+    if not path or not any(rows_by_account.values()):
         return
     agg = defaultdict(lambda: {"광고비": 0, "클릭수": 0, "전환수": 0, "전환가치": 0})
-    for r in rows:
-        a = agg[r["계정ID"]]
-        for k in a:
-            a[k] += r[k]
+    for cid, rows in rows_by_account.items():
+        a = agg[cid]
+        for r in rows:
+            for k in a:
+                a[k] += r[k]
     lines = [f"### 네이버 검색광고 리포트 {since} ~ {until}", "",
              "| 계정 | 광고비 | 클릭 | 전환 | 전환매출 | ROAS |", "|---|---:|---:|---:|---:|---:|"]
     for name, a in agg.items():
@@ -263,12 +257,13 @@ def main():
         return
     print(f"기간 {since} ~ {until} / 계정 {len(targets)}개")
 
-    rows, done, failed = [], set(), []
+    rows, by_account, done_campaigns, failed = [], {}, set(), []
     for cid in targets:
         try:
-            r = fetch_account(cid, since, until)
+            r, camp_ids = fetch_account(cid, since, until)
             rows.extend(r)
-            done.add(cid)
+            by_account[cid] = r
+            done_campaigns |= camp_ids
             print(f"  ✓ {cid}: {len(r)}행")
         except Exception as e:
             failed.append(cid)
@@ -282,10 +277,10 @@ def main():
             w.writeheader()
             w.writerows(rows)
         print(f"\nCSV 저장: {out} ({len(rows)}행)")
-        write_summary(rows, since, until)
+        write_summary(by_account, since, until)
 
-    if get_env("SHEET_ID", required=False) and done:
-        upsert_sheet(rows, since, until, done)
+    if get_env("SHEET_ID", required=False) and done_campaigns:
+        upsert_sheet(rows, since, until, done_campaigns)
 
     if failed:
         sys.exit(f"실패 계정: {', '.join(failed)}")
