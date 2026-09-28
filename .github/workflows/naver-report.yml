@@ -2,27 +2,62 @@ name: Naver SearchAd Daily Report
 
 on:
   schedule:
-    - cron: "20 23 * * *"   # 매일 08:20 KST
+    - cron: "20 23 * * *"   # 매일 08:20 KST: 전체 RAW, 최근 14일, 시트 적재
   workflow_dispatch:
     inputs:
       since:
-        description: "시작일 (YYYY-MM-DD, 비우면 최근 14일)"
+        description: "시작일 (YYYY-MM-DD, 비우면 lookback_days 사용)"
+        type: string
         required: false
       until:
-        description: "종료일 (YYYY-MM-DD, 비우면 시작일과 동일)"
+        description: "종료일 (YYYY-MM-DD, 시작일만 입력하면 동일 날짜)"
+        type: string
         required: false
+      lookback_days:
+        description: "수동 실행 조회 일수 (성별·연령은 최대 최근 7일)"
+        type: choice
+        options:
+          - "1"
+          - "7"
+          - "14"
+        default: "1"
+      reports:
+        description: "수집 RAW (all=5종, 지원 범위는 Python 안내 참고)"
+        type: choice
+        options:
+          - all
+          - campaign
+          - search
+          - media
+          - gender
+          - age
+        default: all
+      dry_run:
+        description: "테스트: API 조회·CSV 생성만 수행, 시트 변경 안 함"
+        type: boolean
+        default: true
       list_accounts:
-        description: "계정별 접근 확인만 실행"
+        description: "계정별 접근 확인만 실행 (다른 입력은 무시)"
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 concurrency:
   group: sheet-write-naver
+  cancel-in-progress: false
 
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -30,10 +65,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements-naver.txt
 
-      - run: pip install -r requirements.txt
+      # 저장소 루트에 수정본 naver_report.py와 requirements-naver.txt를 함께 배치
+      - name: Install Naver report dependencies
+        run: python -m pip install -r requirements-naver.txt
 
-      - name: Fetch Naver SearchAd report
+      - name: Fetch Naver SearchAd RAW reports
+        timeout-minutes: 80
         env:
           NAVER_API_KEY: ${{ secrets.NAVER_API_KEY }}
           NAVER_SECRET_KEY: ${{ secrets.NAVER_SECRET_KEY }}
@@ -41,21 +80,46 @@ jobs:
           NAVER_CUSTOMER_IDS: ${{ secrets.NAVER_CUSTOMER_IDS }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          NAVER_RAW_PREFIX: naver_raw
+          NAVER_REPORT_TIMEOUT: "600"
+          IN_EVENT: ${{ github.event_name }}
           IN_SINCE: ${{ inputs.since }}
           IN_UNTIL: ${{ inputs.until }}
+          IN_LOOKBACK: ${{ inputs.lookback_days }}
+          IN_REPORTS: ${{ inputs.reports }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
           IN_LIST: ${{ inputs.list_accounts }}
         run: |
+          set -euo pipefail
           ARGS=()
-          [ -n "$IN_SINCE" ] && ARGS+=(--since "$IN_SINCE")
-          [ -n "$IN_UNTIL" ] && ARGS+=(--until "$IN_UNTIL")
-          [ "$IN_LIST" = "true" ] && ARGS+=(--list-accounts)
+          if [[ "$IN_EVENT" == "schedule" ]]; then
+            # 정기 실행은 수동 입력 기본값과 무관하게 최근 14일·전체 RAW를 시트에 적재
+            ARGS+=(--lookback-days 14)
+          elif [[ "$IN_LIST" == "true" ]]; then
+            ARGS+=(--list-accounts)
+          else
+            ARGS+=(--lookback-days "${IN_LOOKBACK:-1}")
+            if [[ -n "$IN_SINCE" ]]; then
+              ARGS+=(--since "$IN_SINCE")
+            fi
+            if [[ -n "$IN_UNTIL" ]]; then
+              ARGS+=(--until "$IN_UNTIL")
+            fi
+            if [[ -n "$IN_REPORTS" && "$IN_REPORTS" != "all" ]]; then
+              ARGS+=(--reports "$IN_REPORTS")
+            fi
+            # 수동/API 실행 시 값이 없더라도 테스트를 기본으로 사용
+            if [[ "${IN_DRY_RUN:-true}" != "false" ]]; then
+              ARGS+=(--dry-run)
+            fi
+          fi
           python naver_report.py "${ARGS[@]}"
 
-      - name: Upload CSV
+      - name: Upload RAW CSV, collection status and backups
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: naver-report-${{ github.run_number }}
+          name: naver-report-${{ github.run_number }}-${{ github.run_attempt }}
           path: reports/
           retention-days: 30
           if-no-files-found: ignore
