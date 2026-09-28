@@ -1,290 +1,619 @@
 #!/usr/bin/env python3
-"""
-네이버 검색광고 캠페인 성과 → 구글 시트 적재 (최근 N일 upsert) + CSV 백업
-
-환경변수
-  NAVER_API_KEY       : 액세스 라이선스
-  NAVER_SECRET_KEY    : 비밀키
-  NAVER_CUSTOMER_ID   : 키를 발급한 계정의 CUSTOMER_ID
-  NAVER_CUSTOMER_IDS  : 조회할 광고주 CUSTOMER_ID, 쉼표 구분 (비우면 NAVER_CUSTOMER_ID)
-  GCP_SA_KEY, SHEET_ID: 메타·구글과 동일
-  NAVER_SHEET_TAB     : 기본 naver_daily
-
-사용법
-  python naver_report.py                       # 최근 14일(어제까지) 재조회 → 시트 덮어쓰기
-  python naver_report.py --since 2026-09-01 --until 2026-09-22
-  python naver_report.py --list-accounts       # 계정별 접근·캠페인 조회 확인
+"""Naver Search Ads → 5 RAW tabs. See README.md for API coverage limits.
+No credentials at import time. Python 3.10+, gspread 6.x for sheet writes.
 """
 import argparse
 import base64
 import csv
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
 import time
-from collections import defaultdict
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-import requests
-
-BASE_URL = "https://api.naver.com"
 KST = timezone(timedelta(hours=9))
-LOOKBACK_DAYS = 14  # 계정의 전환 기여 기간 설정에 맞춰 조정
-STAT_FIELDS = ["impCnt", "clkCnt", "salesAmt", "avgRnk", "ccnt", "convAmt"]
+BASE_URL = 'https://api.searchad.naver.com'
+REPORTS = ('campaign', 'search', 'media', 'gender', 'age')
+DIMS = {
+    'campaign': ['일별', '캠페인 유형', '캠페인'],
+    'search': ['일별', '캠페인 유형', '캠페인', '광고그룹', '검색어'],
+    'media': ['일별', '캠페인 유형', '캠페인', '광고그룹', 'PC/모바일 매체', '검색/콘텐츠 매체'],
+    'gender': ['일별', '캠페인 유형', '캠페인', '광고그룹', '성별'],
+    'age': ['일별', '캠페인 유형', '캠페인', '광고그룹', '연령대'],
+}
+METRICS = ['노출수', '클릭수', '총비용', '구매완료 전환수', '구매완료 전환매출액', '평균노출순위']
+META = ['계정ID', '캠페인ID', '광고그룹ID', '데이터출처', '비고', '수집시각']
+FIELDS = ['impCnt', 'clkCnt', 'salesAmt', 'purchaseCcnt', 'purchaseConvAmt', 'avgRnk']
+TYPES = {'WEB_SITE': '파워링크', 'SHOPPING': '쇼핑검색', 'BRAND_SEARCH': '브랜드검색',
+         'POWER_CONTENTS': '파워컨텐츠', 'PLACE': '플레이스'}
+# Official positional TSV schemas. A changed column count is a hard error.
+SCHEMAS = {
+    'AD': 'day customer campaign group keyword ad biz media device imp click cost rank view'.split(),
+    'AD_CONVERSION': 'day customer campaign group keyword ad biz media device method conv_type conv revenue'.split(),
+    'EXPKEYWORD': 'day customer campaign group query media device query_type imp click cost view'.split(),
+    'SHOPPINGKEYWORD_DETAIL': 'day customer campaign group query ad biz hour region media device imp click cost rank view'.split(),
+    'SHOPPINGKEYWORD_CONVERSION_DETAIL': 'day customer campaign group query ad biz hour region media device method conv_type conv revenue'.split(),
+}
 
 
-def get_env(name, required=True, default=""):
-    value = os.getenv(name, "").strip() or default
-    if required and not value:
-        sys.exit(f"[오류] 환경변수 {name} 가 비어 있습니다.")
-    return value
+def env(name, default=None):
+    value = os.environ.get(name, '').strip()
+    if value:
+        return value
+    if default is not None:
+        return default
+    raise ValueError(f'환경변수 {name}가 필요합니다.')
 
 
-API_KEY = get_env("NAVER_API_KEY")
-SECRET_KEY = get_env("NAVER_SECRET_KEY")
-OWNER_ID = get_env("NAVER_CUSTOMER_ID")
+def number(v):
+    try:
+        n = Decimal(str(v).replace(',', ''))
+    except (InvalidOperation, ValueError):
+        raise ValueError('숫자 필드 누락 또는 잘못된 숫자') from None
+    if not n.is_finite():
+        raise ValueError('유한하지 않은 숫자')
+    return int(n) if n == n.to_integral_value() else float(n)
 
 
-# ───────────────────────── 인증·호출 ─────────────────────────
-def headers(method, uri, customer_id):
-    ts = str(int(time.time() * 1000))
-    msg = f"{ts}.{method}.{uri}"
-    sig = base64.b64encode(hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()).decode()
-    return {
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Timestamp": ts,
-        "X-API-KEY": API_KEY,
-        "X-Customer": str(customer_id),
-        "X-Signature": sig,
-    }
-
-
-def api_get(uri, customer_id, params=None, max_retry=5):
-    for attempt in range(max_retry):
-        r = requests.get(BASE_URL + uri, params=params, headers=headers("GET", uri, customer_id), timeout=60)
-        if r.status_code == 429 or r.status_code >= 500:
-            wait = 5 * (attempt + 1)
-            print(f"  ↻ {r.status_code} → {wait}초 후 재시도")
-            time.sleep(wait)
-            continue
-        if not r.ok:
-            try:
-                err = r.json()
-                msg = f"{err.get('code')} {err.get('title') or err.get('message')}"
-            except ValueError:
-                msg = r.text[:300]
-            raise RuntimeError(f"HTTP {r.status_code}: {msg}")
-        return r.json()
-    raise RuntimeError("재시도 횟수 초과")
-
-
-# ───────────────────────── 수집 ─────────────────────────
-def check_accounts(targets):
-    """발급 계정과 대상 계정별로 API 접근·캠페인 조회 확인"""
-    print("\n[계정 접근 확인]")
-    checks = [("발급 계정 (NAVER_CUSTOMER_ID)", OWNER_ID)]
-    checks += [(f"대상 {i} (NAVER_CUSTOMER_IDS)", c) for i, c in enumerate(targets, 1) if c != OWNER_ID]
-    for label, cid in checks:
-        try:
-            camps = api_get("/ncc/campaigns", cid)
-            print(f"  ✓ {label}: 캠페인 {len(camps)}개")
-            for c in camps[:10]:
-                print(f"      - {c.get('name')} ({c.get('campaignTp')})")
-        except Exception as e:
-            print(f"  ✗ {label}: {e}")
-
-
-def get_campaigns(customer_id):
-    data = api_get("/ncc/campaigns", customer_id)
-    return {c["nccCampaignId"]: c for c in data}
-
-
-STAT_MODE = {"mode": None}  # "batch"(쉼표 일괄) 또는 "single"(캠페인별)
-SKIPPED = set()
-
-
-def get_stats(customer_id, ids, day, names):
-    fields = json.dumps(STAT_FIELDS)
-    time_range = json.dumps({"since": day, "until": day})
-
-    if STAT_MODE["mode"] in (None, "batch"):
-        try:
-            out = []
-            for i in range(0, len(ids), 100):
-                res = api_get("/stats", customer_id, {
-                    "ids": ",".join(ids[i:i + 100]), "fields": fields, "timeRange": time_range,
-                })
-                out.extend(res.get("data", []))
-            STAT_MODE["mode"] = "batch"
-            return out
-        except RuntimeError as e:
-            if "11001" not in str(e) or STAT_MODE["mode"] == "batch":
-                raise
-            print("  일괄 조회 형식 불가 → 캠페인별 조회로 전환")
-            STAT_MODE["mode"] = "single"
-
-    out = []
-    for cid in ids:
-        if cid in SKIPPED:
-            continue
-        try:
-            res = api_get("/stats", customer_id, {"id": cid, "fields": fields, "timeRange": time_range})
-        except RuntimeError as e:
-            if "11001" in str(e):
-                SKIPPED.add(cid)
-                print(f"  - 통계 조회 불가, 건너뜀: {names.get(cid, '')} ({cid})")
-                continue
-            raise
-        for d in res.get("data", []):
-            d.setdefault("id", cid)
-            out.append(d)
-    return out
-
-
-def daterange(since, until):
-    d, end = date.fromisoformat(since), date.fromisoformat(until)
-    while d <= end:
+def days(since, until):
+    d = date.fromisoformat(since)
+    while d <= date.fromisoformat(until):
         yield d.isoformat()
         d += timedelta(days=1)
 
 
-def num(v):
+def normalize_day(value):
+    s = str(value).strip()
+    if len(s) == 8 and s.isdigit():
+        return datetime.strptime(s, '%Y%m%d').date().isoformat()
+    return date.fromisoformat(s[:10]).isoformat()
+
+
+def table_bytes(content):
+    if content.startswith(b'\x1f\x8b'):
+        content = gzip.decompress(content)
+    elif content.startswith(b'PK\x03\x04'):
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            files = [n for n in z.namelist() if not n.endswith('/')]
+            if len(files) != 1:
+                raise ValueError('보고서 ZIP은 데이터 파일 1개여야 합니다.')
+            content = z.read(files[0])
     try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
+        return content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return content.decode('cp949')
 
 
-def fetch_account(customer_id, since, until):
-    """(행 목록, 이 계정의 캠페인ID 집합) 반환"""
-    campaigns = get_campaigns(customer_id)
-    if not campaigns:
-        return [], set()
-    ids = list(campaigns)
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+def parse_report(content, report, customer, day):
+    schema = SCHEMAS[report]
+    text = table_bytes(content)
+    if text.lstrip().startswith(('<', '{', '[')):
+        raise ValueError('보고서 다운로드가 TSV가 아닙니다.')
     rows = []
-    for day in daterange(since, until):
-        names = {k: v.get("name", "") for k, v in campaigns.items()}
-        for s in get_stats(customer_id, ids, day, names):
-            imp, clk = int(num(s.get("impCnt"))), int(num(s.get("clkCnt")))
-            cost, conv, val = round(num(s.get("salesAmt"))), num(s.get("ccnt")), round(num(s.get("convAmt")))
-            if not (imp or cost or conv):
+    for line, cells in enumerate(csv.reader(io.StringIO(text), delimiter='\t'), 1):
+        if not cells or all(v == '' for v in cells):
+            continue
+        if len(cells) != len(schema):
+            raise ValueError(f'{report} {line}행: 열 수 {len(cells)}, 예상 {len(schema)}. 스키마 확인 필요')
+        r = dict(zip(schema, cells))
+        if normalize_day(r['day']) != day or r['customer'] != str(customer):
+            raise ValueError(f'{report}: 요청한 계정/날짜와 응답 불일치')
+        for k in ('imp', 'click', 'cost', 'rank', 'conv', 'revenue'):
+            if k in r:
+                r[k] = number(r[k])
+        rows.append(r)
+    return rows
+
+
+class Client:
+    def __init__(self):
+        self.key = env('NAVER_API_KEY')
+        self.secret = env('NAVER_SECRET_KEY')
+        self.poll_timeout = int(env('NAVER_REPORT_TIMEOUT', '600'))
+
+    def headers(self, method, path, customer):
+        ts = str(int(time.time() * 1000))
+        sig = base64.b64encode(hmac.new(self.secret.encode(),
+                    f'{ts}.{method}.{path}'.encode(), hashlib.sha256).digest()).decode()
+        return {'Content-Type': 'application/json; charset=UTF-8', 'X-Timestamp': ts,
+                'X-API-KEY': self.key, 'X-Customer': str(customer), 'X-Signature': sig}
+
+    def request(self, method, path, customer, params=None, body=None, raw_url=None):
+        url = raw_url or BASE_URL + path
+        if params:
+            url += '?' + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body is not None else None
+        # Never print signed download URLs, headers, or server response bodies.
+        for attempt in range(5):
+            req = urllib.request.Request(url, data=data, method=method,
+                    headers=self.headers(method, path, customer))
+            try:
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    content = response.read()
+                return content if raw_url else json.loads(content)
+            except urllib.error.HTTPError as e:
+                status = e.code
+                code = ''
+                try:
+                    code = str(json.loads(e.read()).get('code', ''))
+                except (ValueError, AttributeError):
+                    pass
+                if status != 429 and status < 500:
+                    raise RuntimeError(f'{method} {path}: HTTP {status}, API code {code}') from None
+                reason = f'HTTP {status}'
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                reason = 'network/timeout'
+            if attempt == 4:
+                raise RuntimeError(f'{method} {path}: 재시도 초과 ({reason})')
+            time.sleep(min(2 ** (attempt + 1), 20))
+
+    def get(self, path, customer, params=None):
+        return self.request('GET', path, customer, params=params)
+
+    def download(self, url, customer):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme != 'https' or u.hostname not in ('api.searchad.naver.com', 'api.naver.com') or u.path != '/report-download':
+            raise ValueError('예상하지 못한 보고서 다운로드 주소: 공식 스펙 확인 필요')
+        # Keep returned URL including fileVersion, sign only pathname.
+        return self.request('GET', u.path, customer, raw_url=url)
+
+    def job(self, customer, report=None, day=None, item=None):
+        master = item is not None
+        path = '/master-reports' if master else '/stat-reports'
+        payload = {'item': item} if master else {'reportTp': report, 'statDt': day.replace('-', '')}
+        for generation in range(2):
+            job = self.request('POST', path, customer, body=payload)
+            job_id = job.get('id' if master else 'reportJobId')
+            if job_id is None:
+                raise ValueError('보고서 작업 ID 누락')
+            deadline = time.monotonic() + self.poll_timeout
+            while True:
+                status = str(job.get('status', '')).upper()
+                if status == 'BUILT':
+                    if not job.get('downloadUrl'):
+                        raise ValueError('BUILT 보고서에 다운로드 URL 누락')
+                    return self.download(job['downloadUrl'], customer)
+                if status == 'NONE':
+                    return b''
+                if status == 'CHANGED':
+                    break
+                if status == 'ERROR':
+                    raise RuntimeError('보고서 생성 ERROR')
+                if status not in ('REGIST', 'RUNNING', 'WAITING', 'AGGREGATING'):
+                    raise RuntimeError(f'알 수 없는 보고서 상태: {status}')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('보고서 생성 제한시간 초과')
+                time.sleep(5)
+                job = self.get(f'{path}/{job_id}', customer)
+        raise RuntimeError('보고서 데이터 변경으로 재생성 필요')
+
+
+def stats_data(response):
+    if not isinstance(response, dict):
+        raise ValueError('stats 응답 형식 오류')
+    for key in ('summaryStatResponse', 'dailyStatResponse'):
+        if key in response:
+            response = response[key]
+            break
+    if not isinstance(response, dict) or not isinstance(response.get('data'), list):
+        raise ValueError('stats data 배열 누락')
+    return response['data']
+
+
+def metric_values(s):
+    # Missing purchase metrics must NEVER fall back to total conversions or zero.
+    v = [number(s[f]) for f in FIELDS[:5]]
+    rank = s.get('avgRnk')
+    rank = number(rank) if rank not in (None, '', '-') else ''
+    if rank == 0:
+        rank = ''
+    return dict(zip(METRICS, v + [rank]))
+
+
+class Collector:
+    def __init__(self, client, customer):
+        self.client, self.customer = client, str(customer)
+        self.campaigns = {}
+        self.groups = {}
+        self.media = None
+        self.cache = {}
+        self.group_errors = {}
+        camps = client.get('/ncc/campaigns', customer)
+        if not isinstance(camps, list):
+            raise ValueError('캠페인 목록 형식 오류')
+        self.campaigns = {c['nccCampaignId']: c for c in camps}
+
+    def load_groups(self):
+        for cid in self.campaigns:
+            try:
+                cursor = None
+                while True:
+                    p = {'nccCampaignId': cid, 'recordSize': 1000, 'selector': 'NEXT'}
+                    if cursor:
+                        p['baseSearchId'] = cursor
+                    part = self.client.get('/ncc/adgroups', self.customer, p)
+                    if not isinstance(part, list):
+                        raise ValueError('광고그룹 목록 형식 오류')
+                    for g in part:
+                        self.groups[g['nccAdgroupId']] = g
+                    if len(part) < 1000:
+                        break
+                    next_cursor = part[-1]['nccAdgroupId']
+                    if next_cursor == cursor:
+                        raise ValueError('광고그룹 페이지 이동 실패')
+                    cursor = next_cursor
+            except Exception as e:
+                self.group_errors[cid] = str(e)
+
+    def base(self, day, cid, gid='', source=''):
+        c = self.campaigns.get(cid, {})
+        g = self.groups.get(gid, {})
+        tp = c.get('campaignTp', '')
+        notes = []
+        if not c:
+            notes.append('캠페인 메타정보 없음(ID 유지)')
+        if gid and not g:
+            notes.append('광고그룹 메타정보 없음(ID 유지)')
+        return {'일별': day, '캠페인 유형': TYPES.get(tp, tp or '미확인'),
+                '캠페인': c.get('name', cid), '광고그룹': g.get('name', gid),
+                '계정ID': self.customer, '캠페인ID': cid, '광고그룹ID': gid,
+                '데이터출처': source, '비고': '; '.join(notes),
+                '수집시각': datetime.now(KST).isoformat(timespec='seconds')}
+
+    def stat(self, entity, day, breakdown=None):
+        p = {'id': entity, 'fields': json.dumps(FIELDS),
+             'timeRange': json.dumps({'since': day, 'until': day}), 'timeIncrement': 'allDays'}
+        if breakdown:
+            p['breakdown'] = breakdown
+        return stats_data(self.client.get('/stats', self.customer, p))
+
+    def campaign(self, day):
+        out = []
+        for cid in self.campaigns:
+            entries = self.stat(cid, day)
+            if len(entries) > 1:
+                raise ValueError('캠페인 일자 요약이 여러 행으로 반환됨')
+            for s in entries:
+                if s.get('id', cid) != cid:
+                    raise ValueError('캠페인 stats ID 불일치')
+                r = self.base(day, cid, source='stats')
+                r.update(metric_values(s))
+                out.append(r)
+        return out
+
+    def demographic(self, day, report):
+        breakdown, label = ('genderNm', '성별') if report == 'gender' else ('ageRangeNm', '연령대')
+        shopping = {k for k,v in self.campaigns.items() if v.get('campaignTp') == 'SHOPPING'}
+        if shopping.intersection(self.group_errors):
+            raise ValueError('쇼핑검색 광고그룹 목록 조회 실패: 기존 데이터 보존')
+        out = []
+        for gid, g in self.groups.items():
+            cid = g.get('nccCampaignId')
+            if cid not in shopping:
                 continue
-            c = campaigns.get(s.get("id"), {})
-            rows.append({
-                "날짜": day,
-                "캠페인ID": s.get("id"),
-                "캠페인명": c.get("name", ""),
-                "캠페인유형": c.get("campaignTp", ""),
-                "통화": "KRW",
-                "노출수": imp,
-                "클릭수": clk,
-                "광고비": cost,
-                "평균순위": round(num(s.get("avgRnk")), 1),
-                "전환수": int(conv),
-                "전환가치": val,
-                "수집시각": now,
-            })
-    return rows, set(ids)
+            entries = self.stat(gid, day, breakdown)
+            if len(entries) > 1:
+                raise ValueError('성별/연령 요약 응답이 예상과 다름')
+            seen = set()
+            for s in entries:
+                if s.get('id', gid) != gid:
+                    raise ValueError('광고그룹 stats ID 불일치')
+                splits = s.get('breakdowns')
+                if splits is None or splits == []:
+                    vals = metric_values(s)
+                    if any(vals[m] != 0 for m in METRICS[:5]):
+                        raise ValueError(f'{breakdown} 상세 누락: 전체 합계를 세부 데이터로 저장하지 않음')
+                    continue
+                if not isinstance(splits, list):
+                    raise ValueError('breakdowns 배열 형식 오류')
+                for b in splits:
+                    name = b.get('name')
+                    if name in (None, '') or str(name) in seen:
+                        raise ValueError('breakdown 구분값 누락/중복')
+                    seen.add(str(name))
+                    r = self.base(day, cid, gid, 'stats:' + breakdown)
+                    r[label] = str(name)
+                    r.update(metric_values(b))
+                    r['비고'] = '쇼핑검색만 수집; 최근 7일 재조회; 그 외 캠페인 미포함'
+                    out.append(r)
+        return out
+
+    def bulk(self, report, day):
+        key = report, day
+        if key not in self.cache:
+            content = self.client.job(self.customer, report=report, day=day)
+            self.cache[key] = parse_report(content, report, self.customer, day)
+        return self.cache[key]
+
+    def load_media(self):
+        if self.media is not None:
+            return
+        raw = self.client.job(self.customer, item='Media')
+        media = {}
+        for n, c in enumerate(csv.reader(io.StringIO(table_bytes(raw)), delimiter='\t'), 1):
+            if not c or all(v == '' for v in c):
+                continue
+            if len(c) != 13:
+                raise ValueError(f'Media 마스터 {n}행: 스키마 불일치')
+            if c[0].lower() != 'media':
+                continue
+            def boolean(value):
+                if value.lower() not in ('true', 'false', '1', '0'):
+                    raise ValueError('매체 마스터 boolean 형식 오류')
+                return value.lower() in ('true', '1')
+            search, content = boolean(c[8]), boolean(c[9])
+            if search == content:
+                media[c[1]] = '분류미확인:' + c[1]
+            else:
+                media[c[1]] = '검색' if search else '콘텐츠'
+        if not media:
+            raise ValueError('Media 마스터 비어 있음')
+        self.media = media
+
+    def media_report(self, day):
+        self.load_media()
+        perf = self.bulk('AD', day)
+        conv = self.bulk('AD_CONVERSION', day)
+        def key(r):
+            dev = r['device']
+            if dev.upper() == 'PC':
+                dev = 'PC'
+            elif dev.upper() in ('MOBILE', 'MOBILE_APP', 'MOB'):
+                dev = '모바일'
+            # Undocumented values are kept, never guessed as PC/Mobile.
+            classification = self.media.get(r['media'], '분류미확인:' + r['media'])
+            return r['campaign'], r['group'], dev, classification
+        return self.aggregate(day, perf, conv, key, ['PC/모바일 매체', '검색/콘텐츠 매체'],
+                              'AD+AD_CONVERSION+Media', purchase=True, rank=True)
+
+    def search(self, day):
+        # Separate source streams: never fabricate Powerlink conversions from registered keywords.
+        key = lambda r: (r['campaign'], r['group'], r['query'])
+        power = self.aggregate(day, self.bulk('EXPKEYWORD', day), [], key, ['검색어'],
+                               'EXPKEYWORD', purchase=False, rank=False)
+        shop = self.aggregate(day, self.bulk('SHOPPINGKEYWORD_DETAIL', day),
+                              self.bulk('SHOPPINGKEYWORD_CONVERSION_DETAIL', day), key, ['검색어'],
+                              'SHOPPINGKEYWORD_DETAIL+SHOPPINGKEYWORD_CONVERSION_DETAIL', purchase=True, rank=True)
+        for r in power:
+            r['비고'] = (r['비고'] + '; 파워링크 검색어: 구매완료 전환수·매출액·평균노출순위 API 미제공').strip('; ')
+        for r in shop:
+            r['비고'] = (r['비고'] + '; 검색어가 있는 검색 지면만 집계').strip('; ')
+        return power + shop
+
+    def aggregate(self, day, perf, conv, keyfn, labels, source, purchase, rank):
+        totals = {}
+        def bucket(s):
+            k = keyfn(s)
+            if k not in totals:
+                totals[k] = {'imp': 0, 'click': 0, 'cost': Decimal(0), 'rank': 0, 'conv': 0, 'revenue': Decimal(0)}
+            return totals[k]
+        for s in perf:
+            b = bucket(s)
+            for f in ('imp', 'click', 'rank'):
+                b[f] += s.get(f, 0)
+            b['cost'] += Decimal(str(s['cost']))
+        for s in conv:
+            if s['conv_type'] != 'purchase':
+                continue
+            b = bucket(s)
+            b['conv'] += s['conv']
+            b['revenue'] += Decimal(str(s['revenue']))
+        out = []
+        for k, b in totals.items():
+            r = self.base(day, k[0], k[1], source)
+            r.update(zip(labels, k[2:]))
+            r.update({'노출수': b['imp'], '클릭수': b['click'], '총비용': number(b['cost']),
+                      '구매완료 전환수': b['conv'] if purchase else '',
+                      '구매완료 전환매출액': number(b['revenue']) if purchase else '',
+                      '평균노출순위': round(b['rank'] / b['imp'], 2) if rank and b['imp'] and b['rank'] else ''})
+            if any(str(v).startswith('분류미확인:') for v in k):
+                r['비고'] += '; 매체 분류 확인 필요'
+            out.append(r)
+        return out
 
 
-# ───────────────────────── 시트 ─────────────────────────
-def upsert_sheet(new_rows, since, until, done_campaign_ids):
-    import gspread
-
-    gc = gspread.service_account_from_dict(json.loads(get_env("GCP_SA_KEY")))
-    sh = gc.open_by_key(get_env("SHEET_ID"))
-    tab = get_env("NAVER_SHEET_TAB", required=False, default="naver_daily")
-    try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=30)
-
-    values = ws.get_values(value_render_option="UNFORMATTED_VALUE")
-    old_header = values[0] if values else []
-    old_rows = [dict(zip(old_header, v)) for v in values[1:]] if values else []
-    kept = [r for r in old_rows
-            if not (since <= str(r.get("날짜", "")) <= until and str(r.get("캠페인ID", "")) in done_campaign_ids)]
-    removed = len(old_rows) - len(kept)
-
-    # 새 컬럼 구성만 사용 → 기존 시트에 남아 있던 삭제 컬럼(계정ID, CTR 등)도 같이 정리됨
-    header = list(new_rows[0].keys()) if new_rows else old_header
-    merged = kept + new_rows
-    merged.sort(key=lambda r: (str(r.get("날짜", "")), num(r.get("광고비"))), reverse=True)
-    out = [header] + [[r.get(h, "") for h in header] for r in merged]
-    ws.resize(rows=max(len(out), 2), cols=max(len(header), 1))
-    ws.update(out, "A1", value_input_option="RAW")
-    ws.freeze(rows=1)
-    print(f"\n시트 적재 완료: '{tab}' 탭 / 교체 {removed}행 → 신규 {len(new_rows)}행 / 전체 {len(merged)}행")
+def header(report):
+    return DIMS[report] + METRICS + META
 
 
-def write_summary(rows_by_account, since, until):
-    path = os.getenv("GITHUB_STEP_SUMMARY")
-    if not path or not any(rows_by_account.values()):
-        return
-    agg = defaultdict(lambda: {"광고비": 0, "클릭수": 0, "전환수": 0, "전환가치": 0})
-    for cid, rows in rows_by_account.items():
-        a = agg[cid]
-        for r in rows:
-            for k in a:
-                a[k] += r[k]
-    lines = [f"### 네이버 검색광고 리포트 {since} ~ {until}", "",
-             "| 계정 | 광고비 | 클릭 | 전환 | 전환매출 | ROAS |", "|---|---:|---:|---:|---:|---:|"]
-    for name, a in agg.items():
-        roas = f"{a['전환가치'] / a['광고비'] * 100:.0f}%" if a["광고비"] else "-"
-        lines.append(f"| {name} | {a['광고비']:,} | {a['클릭수']:,} | {a['전환수']:,} | {a['전환가치']:,} | {roas} |")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+def row_key(r, report):
+    extras = DIMS[report][4:] if report != 'campaign' else []
+    return tuple(str(r.get(c, '')) for c in ['계정ID', '일별', '캠페인ID', '광고그룹ID'] + extras)
 
 
-# ───────────────────────── 실행 ─────────────────────────
-def main():
-    today = datetime.now(KST).date()
-    p = argparse.ArgumentParser()
-    p.add_argument("--since")
-    p.add_argument("--until")
-    p.add_argument("--list-accounts", action="store_true")
-    args = p.parse_args()
+def merge_rows(old, new, scopes, report):
+    # Scope = account/day; campaign and demographic reports additionally scope to queried entities.
+    # Commit only after ALL required calls for that report/day succeed.
+    def covered(r):
+        key = tuple(str(r.get(c, '')) for c in ['계정ID', '일별', '캠페인ID', '광고그룹ID'])
+        return any(key[:length] in scopes for length in (2, 3, 4))
+    kept = [r for r in old if not covered(r)]
+    out = kept + new
+    seen = set()
+    for r in out:
+        k = row_key(r, report)
+        if k in seen:
+            raise ValueError(f'{report}: 중복 키 발견. 쓰기 중단')
+        seen.add(k)
+    return sorted(out, key=lambda r: (str(r['일별']), str(r['계정ID']), str(r['캠페인ID']), str(r.get('광고그룹ID', ''))), reverse=True)
 
-    since = args.since or (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    until = args.until or (args.since if args.since else (today - timedelta(days=1)).isoformat())
-    targets = [c.strip() for c in get_env("NAVER_CUSTOMER_IDS", required=False, default=OWNER_ID).split(",") if c.strip()]
-    if args.list_accounts:
-        check_accounts(targets)
-        return
-    print(f"기간 {since} ~ {until} / 계정 {len(targets)}개")
 
-    rows, by_account, done_campaigns, failed = [], {}, set(), []
-    for cid in targets:
+class SheetWriter:
+    def __init__(self):
+        import gspread
+        self.gspread = gspread
+        self.sh = gspread.service_account_from_dict(json.loads(env('GCP_SA_KEY'))).open_by_key(env('SHEET_ID'))
+
+    def write(self, report, rows, scopes, outdir):
+        tab = env('NAVER_RAW_PREFIX', 'naver_raw') + '_' + report
+        h = header(report)
         try:
-            r, camp_ids = fetch_account(cid, since, until)
-            rows.extend(r)
-            by_account[cid] = r
-            done_campaigns |= camp_ids
-            print(f"  ✓ {cid}: {len(r)}행")
+            ws = self.sh.worksheet(tab)
+            values = ws.get_values(value_render_option='UNFORMATTED_VALUE')
+            if values and values[0] != h:
+                raise ValueError(f'{tab}: 기존 헤더가 다릅니다. 새 NAVER_RAW_PREFIX로 먼저 실행하세요.')
+            old = [dict(zip(h, v + [''] * (len(h) - len(v)))) for v in values[1:] if any(v)] if values else []
+        except self.gspread.WorksheetNotFound:
+            ws, old = None, []
+        merged = merge_rows(old, rows, scopes, report)
+        if ws is not None:
+            write_csv(outdir / f'before_{report}.csv', h, old)
+        if ws is None:
+            ws = self.sh.add_worksheet(title=tab, rows=max(1000, len(merged) + 1), cols=len(h))
+        needed_rows = max(ws.row_count, len(merged) + 1)
+        needed_cols = max(ws.col_count, len(h))
+        # Reserve enough grid space before writing. Never shrink/clear first.
+        if needed_rows != ws.row_count or needed_cols != ws.col_count:
+            ws.resize(rows=needed_rows, cols=needed_cols)
+        grid = [h] + [[r.get(c, '') for c in h] for r in merged]
+        for start in range(0, len(grid), 3000):
+            ws.update(range_name=f'A{start+1}', values=grid[start:start+3000], value_input_option='RAW')
+        old_count = len(old) + 1
+        if old_count > len(grid):
+            ws.batch_clear([f'A{len(grid)+1}:{colname(len(h))}{old_count}'])
+        ws.freeze(rows=1)
+        print(f'{tab}: {len(merged)}행 적재', flush=True)
+
+
+def colname(n):
+    result = ''
+    while n:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def write_csv(path, fields, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', encoding='utf-8-sig', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--since')
+    p.add_argument('--until')
+    p.add_argument('--lookback-days', type=int, default=14)
+    p.add_argument('--reports', default=','.join(REPORTS))
+    p.add_argument('--dry-run', action='store_true', help='API 수집+CSV 생성만, 시트 변경 없음')
+    p.add_argument('--list-accounts', action='store_true')
+    args = p.parse_args()
+    today = datetime.now(KST).date()
+    if args.lookback_days < 1:
+        p.error('--lookback-days must be >= 1')
+    since = args.since or (today - timedelta(days=args.lookback_days)).isoformat()
+    until = args.until or (args.since if args.since else (today - timedelta(days=1)).isoformat())
+    since, until = normalize_day(since), normalize_day(until)
+    if since > until or date.fromisoformat(until) >= today:
+        p.error('시작일 ≤ 종료일 < 오늘(KST)이어야 합니다.')
+    if since < '2026-03-30':
+        p.error('이 버전은 VAT 기준 통일을 위해 2026-03-30 이후만 지원합니다.')
+    selected = list(dict.fromkeys(x.strip() for x in args.reports.split(',') if x.strip()))
+    if not selected or set(selected) - set(REPORTS):
+        p.error('--reports: campaign,search,media,gender,age 중 선택')
+    owner = env('NAVER_CUSTOMER_ID')
+    customers = list(dict.fromkeys(c.strip() for c in env('NAVER_CUSTOMER_IDS', owner).split(',') if c.strip()))
+    client = Client()
+    if args.list_accounts:
+        for customer in customers:
+            c = Collector(client, customer)
+            print(f'{customer}: 캠페인 {len(c.campaigns)}개')
+        return 0
+    runid = datetime.now(KST).strftime('%Y%m%dT%H%M%S')
+    outdir = Path('reports') / f'naver_raw5_{runid}'
+    outdir.mkdir(parents=True, exist_ok=True)
+    result = {r: [] for r in selected}
+    scopes = {r: set() for r in selected}
+    status = []
+    errors = []
+    cutoff = (today - timedelta(days=7)).isoformat()
+    print('범위: 성별/연령=쇼핑검색 최근 7일; 검색어=파워링크+쇼핑검색. 미제공 지표는 빈칸.', flush=True)
+    for customer in customers:
+        try:
+            collector = Collector(client, customer)
+            if set(selected) - {'campaign'}:
+                collector.load_groups()
         except Exception as e:
-            failed.append(cid)
-            print(f"  ✗ {cid}: {e}")
+            errors.append(f'{customer}: 메타데이터 조회 실패 {e}')
+            continue
+        for day in days(since, until):
+            for report in selected:
+                if report in ('gender', 'age') and day < cutoff:
+                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                                   '상태': '기간제한_미조회', '행수': 0, '설명': '최근 7일만 재조회, 기존 행 유지'})
+                    continue
+                try:
+                    method = {'campaign': collector.campaign, 'search': collector.search,
+                              'media': collector.media_report}.get(report)
+                    rows = method(day) if method else collector.demographic(day, report)
+                    # Validate keys before treating a day as replaceable.
+                    merge_rows([], rows, set(), report)
+                    result[report].extend(rows)
+                    if report == 'campaign':
+                        scopes[report].update((customer, day, cid) for cid in collector.campaigns)
+                    elif report in ('gender', 'age'):
+                        scopes[report].update((customer, day, g['nccCampaignId'], gid)
+                            for gid, g in collector.groups.items()
+                            if collector.campaigns.get(g.get('nccCampaignId'), {}).get('campaignTp') == 'SHOPPING')
+                    else:
+                        scopes[report].add((customer, day))
+                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                                   '상태': '수집성공', '행수': len(rows), '설명': '문서의 지원 범위 내 수집'})
+                    print(f'{customer} {day} {report}: {len(rows)}행', flush=True)
+                except Exception as e:
+                    msg = f'{customer} {day} {report}: {e}'
+                    errors.append(msg)
+                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                                   '상태': '실패_기존보존', '행수': 0, '설명': str(e)})
+                    print(msg, file=sys.stderr, flush=True)
+            collector.cache.clear()
+    for report in selected:
+        write_csv(outdir / f'{report}.csv', header(report), result[report])
+    write_csv(outdir / 'collection_status.csv', ['계정ID', '일별', '보고서', '상태', '행수', '설명'], status)
+    if not args.dry_run:
+        try:
+            writer = SheetWriter()
+            for report in selected:
+                if scopes[report]:
+                    try:
+                        writer.write(report, result[report], scopes[report], outdir)
+                    except Exception as e:
+                        errors.append(f'{report}: 시트 쓰기 실패 ({type(e).__name__}): 헤더/권한/용량 확인')
+        except Exception as e:
+            errors.append(f'시트 연결 실패 ({type(e).__name__}): 인증/권한 확인')
+    summary = ['### 네이버 RAW 5종 수집', f'기간: {since} ~ {until}',
+               '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만.',
+               '파워링크 검색어 전환수/매출/평균순위는 미제공(빈칸).',
+               '| RAW | 성공 계정·날짜 | 행수 |', '|---|---:|---:|']
+    summary += [f'| {r} | {len({s[:2] for s in scopes[r]})} | {len(result[r])} |' for r in selected]
+    summary += [f'오류 {len(errors)}건. 상세: collection_status.csv',
+                '성공 수집 수는 API 수집 기준이며, 시트 쓰기 실패는 아래 오류에 별도 표시됩니다.']
+    summary += ['- ' + e for e in errors]
+    text = '\n'.join(summary) + '\n'
+    (outdir / 'summary.md').write_text(text, encoding='utf-8')
+    (outdir / 'errors.json').write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding='utf-8')
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+            f.write(text)
+    print(f'결과 저장: {outdir}', flush=True)
+    return 1 if errors else 0
 
-    if rows:
-        Path("reports").mkdir(exist_ok=True)
-        out = Path("reports") / f"naver_{since}_{until}.csv"
-        with open(out, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=rows[0].keys())
-            w.writeheader()
-            w.writerows(rows)
-        print(f"\nCSV 저장: {out} ({len(rows)}행)")
-        write_summary(by_account, since, until)
 
-    if get_env("SHEET_ID", required=False) and done_campaigns:
-        upsert_sheet(rows, since, until, done_campaigns)
-
-    if failed:
-        sys.exit(f"실패 계정: {', '.join(failed)}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, KeyError) as exc:
+        print(f'실행 중단: {exc}', file=sys.stderr)
+        sys.exit(1)
