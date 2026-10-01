@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Google Ads 캠페인 성과 → 구글 시트 적재 (최근 N일 upsert) + CSV 백업
+Google Ads 캠페인 성과 + Google Channel Purchase 구매 → 구글 시트 적재 (최근 N일 upsert) + CSV 백업
 
 환경변수
   GOOGLE_ADS_DEVELOPER_TOKEN     : MCC API 센터의 개발자 토큰
@@ -10,7 +10,7 @@ Google Ads 캠페인 성과 → 구글 시트 적재 (최근 N일 upsert) + CSV 
   GOOGLE_ADS_LOGIN_CUSTOMER_ID   : MCC 고객 ID (하이픈 없이)
   GOOGLE_ADS_CUSTOMER_IDS        : 조회할 광고계정 ID, 쉼표 구분 (하이픈 있어도 됨)
   GCP_SA_KEY, SHEET_ID           : 메타와 동일한 시트 사용
-  GOOGLE_SHEET_TAB               : 기본 google_daily
+  GOOGLE_SHEET_TAB               : 기본 google_purchase_daily
 
 사용법
   python google_report.py                     # 최근 30일(어제까지) 재조회 → 시트 덮어쓰기
@@ -30,20 +30,10 @@ from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
 KST = timezone(timedelta(hours=9))
-LOOKBACK_DAYS = 30  # 구글 기본 전환 추적 기간(30일) 동안 전환이 클릭일로 소급 반영됨
+LOOKBACK_DAYS = 30  # 재조회 기본값. 실제 계정의 전환 기간과 지연에 맞춰 조정.
 ZERO_DECIMAL = {"KRW", "JPY", "VND", "TWD", "CLP", "ISK", "HUF"}
 
-QUERY = """
-SELECT
-  customer.id, customer.descriptive_name, customer.currency_code,
-  campaign.id, campaign.name, campaign.advertising_channel_type,
-  segments.date,
-  metrics.impressions, metrics.clicks, metrics.cost_micros,
-  metrics.conversions, metrics.conversions_value
-FROM campaign
-WHERE segments.date BETWEEN '{since}' AND '{until}'
-  AND metrics.impressions > 0
-"""
+from google_purchase import fetch_purchase
 
 ACCOUNTS_QUERY = """
 SELECT customer_client.id, customer_client.descriptive_name,
@@ -94,38 +84,7 @@ def list_accounts(client):
 
 
 def fetch(client, customer_id, since, until):
-    svc = client.get_service("GoogleAdsService")
-    rows = []
-    stream = svc.search_stream(customer_id=customer_id, query=QUERY.format(since=since, until=until))
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    for batch in stream:
-        for r in batch.results:
-            cur = r.customer.currency_code
-            cost = r.metrics.cost_micros / 1_000_000
-            clicks = r.metrics.clicks
-            imps = r.metrics.impressions
-            conv = r.metrics.conversions
-            val = r.metrics.conversions_value
-            rows.append({
-                "날짜": r.segments.date,
-                "계정ID": str(r.customer.id),
-                "계정명": r.customer.descriptive_name,
-                "캠페인ID": str(r.campaign.id),
-                "캠페인명": r.campaign.name,
-                "캠페인유형": r.campaign.advertising_channel_type.name,
-                "통화": cur,
-                "노출수": imps,
-                "클릭수": clicks,
-                "CTR(%)": round(clicks / imps * 100, 2) if imps else 0,
-                "광고비": money(cost, cur),
-                "CPC": money(cost / clicks, cur) if clicks else 0,
-                "전환수": round(conv, 2),
-                "전환가치": money(val, cur),
-                "ROAS(%)": round(val / cost * 100, 1) if cost else 0,
-                "CPA": money(cost / conv, cur) if conv else 0,
-                "수집시각": now,
-            })
-    return rows
+    return fetch_purchase(client, customer_id, since, until)
 
 
 def num(v):
@@ -140,7 +99,7 @@ def upsert_sheet(new_rows, since, until, done_ids):
 
     gc = gspread.service_account_from_dict(json.loads(get_env("GCP_SA_KEY")))
     sh = gc.open_by_key(get_env("SHEET_ID"))
-    tab = os.getenv("GOOGLE_SHEET_TAB", "google_daily").strip() or "google_daily"
+    tab = os.getenv("GOOGLE_SHEET_TAB", "google_purchase_daily").strip() or "google_purchase_daily"
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -148,6 +107,8 @@ def upsert_sheet(new_rows, since, until, done_ids):
 
     values = ws.get_values(value_render_option="UNFORMATTED_VALUE")
     old_header = values[0] if values else []
+    if old_header and "구매전환리소스" not in old_header:
+        raise ValueError("기존 전체 전환 탭에 구매 데이터를 혼합할 수 없습니다. 새 탭을 사용하세요.")
     old_rows = [dict(zip(old_header, v)) for v in values[1:]] if values else []
 
     kept = [r for r in old_rows
@@ -162,8 +123,12 @@ def upsert_sheet(new_rows, since, until, done_ids):
     merged = kept + new_rows
     merged.sort(key=lambda r: (str(r.get("날짜", "")), num(r.get("광고비"))), reverse=True)
     out = [header] + [[r.get(h, "") for h in header] for r in merged]
-    ws.resize(rows=max(len(out), 2), cols=max(len(header), 1))
+    # Grow before writing; clear obsolete trailing rows only after a successful write.
+    ws.resize(rows=max(ws.row_count, len(out), 2), cols=max(ws.col_count, len(header), 1))
     ws.update(out, "A1", value_input_option="RAW")
+    if len(values) > len(out):
+        end_cell = gspread.utils.rowcol_to_a1(len(values), len(header))
+        ws.batch_clear([f"A{len(out)+1}:{end_cell}"])
     ws.freeze(rows=1)
     print(f"\n시트 적재 완료: '{tab}' 탭 / 교체 {removed}행 → 신규 {len(new_rows)}행 / 전체 {len(merged)}행")
 
@@ -172,18 +137,18 @@ def write_summary(rows, since, until):
     path = os.getenv("GITHUB_STEP_SUMMARY")
     if not path or not rows:
         return
-    agg = defaultdict(lambda: {"광고비": 0, "클릭수": 0, "전환수": 0, "전환가치": 0})
+    agg = defaultdict(lambda: {"광고비": 0, "클릭수": 0, "구매수": 0, "구매매출": 0})
     for r in rows:
         a = agg[f"{r['계정명'] or r['계정ID']} ({r['통화']})"]
         for k in a:
             a[k] += r[k]
     lines = [f"### Google Ads 리포트 {since} ~ {until}", "",
-             "| 계정 | 광고비 | 클릭 | 전환 | 전환가치 | ROAS |",
+             "| 계정 | 광고비 | 클릭 | 구매 | 구매매출 | ROAS |",
              "|---|---:|---:|---:|---:|---:|"]
     for name, a in agg.items():
-        roas = f"{a['전환가치'] / a['광고비'] * 100:.0f}%" if a["광고비"] else "-"
+        roas = f"{a['구매매출'] / a['광고비'] * 100:.0f}%" if a["광고비"] else "-"
         lines.append(f"| {name} | {a['광고비']:,.2f} | {a['클릭수']:,} | "
-                     f"{a['전환수']:,.1f} | {a['전환가치']:,.2f} | {roas} |")
+                     f"{a['구매수']:,.1f} | {a['구매매출']:,.2f} | {roas} |")
     with open(path, "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -194,9 +159,19 @@ def main():
     p.add_argument("--since")
     p.add_argument("--until")
     p.add_argument("--list-accounts", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="API 조회와 CSV만 생성, 시트 변경 없음")
     args = p.parse_args()
     since = args.since or (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
     until = args.until or (args.since if args.since else (today - timedelta(days=1)).isoformat())
+
+    if not args.list_accounts:
+        try:
+            since = datetime.strptime(since, "%Y-%m-%d").date().isoformat()
+            until = datetime.strptime(until, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            p.error("날짜는 YYYY-MM-DD 형식이어야 합니다.")
+        if since > until or until >= today.isoformat():
+            p.error("시작일 ≤ 종료일 < 오늘(KST)이어야 합니다.")
 
     try:
         client = make_client()
@@ -229,7 +204,7 @@ def main():
 
     if rows:
         Path("reports").mkdir(exist_ok=True)
-        out = Path("reports") / f"google_{since}_{until}.csv"
+        out = Path("reports") / f"google_purchase_{since}_{until}.csv"
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=rows[0].keys())
             w.writeheader()
@@ -237,7 +212,7 @@ def main():
         print(f"\nCSV 저장: {out} ({len(rows)}행)")
         write_summary(rows, since, until)
 
-    if get_env("SHEET_ID", required=False) and done:
+    if not args.dry_run and get_env("SHEET_ID", required=False) and done:
         upsert_sheet(rows, since, until, done)
 
     if failed:
