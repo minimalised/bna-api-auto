@@ -60,6 +60,40 @@ class RawTest(unittest.TestCase):
                 if report == 'campaign':
                     self.assertNotIn('광고그룹명', exported[0])
 
+    def test_existing_tab_routing(self):
+        with patch.dict('os.environ', {'SHEET_TAB': '', 'GOOGLE_SHEET_TAB': '', 'NAVER_RAW_PREFIX': ''}):
+            self.assertEqual(r.existing_tab('meta_campaign_daily_v2'), ('meta_daily', True))
+            self.assertEqual(r.existing_tab('google_campaign_daily_v2'), ('google_daily', True))
+            self.assertEqual(r.existing_tab('naver_campaign_daily_v2'), ('naver_raw_campaign', True))
+
+    def test_existing_headers_and_history_preserved(self):
+        values = [['일별', '계정ID', '캠페인ID', '총비용', '구매완료 전환수', '평균노출순위'],
+                  ['2026-09-30', 'a', 'c', 12, 2, 3]]
+        old, header, keys = r.existing_layout(values, ['날짜', '계정ID', '캠페인ID'] + r.METRICS, 'naver_raw_campaign')
+        self.assertEqual(header[:6], values[0])
+        self.assertNotIn('날짜', header)
+        self.assertNotIn('비용', header)
+        merged = r.merge(old, [dict(row(), **{'계정ID': 'a'})], {('a', '2026-10-01')}, ['계정ID','날짜','캠페인ID'])
+        historical = next(x for x in merged if x['날짜'] == '2026-09-30')
+        self.assertEqual([historical.get(k, '') for k in keys][:6], values[1])
+
+    def test_missing_tabs_never_created(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        class Missing(Exception):
+            pass
+        sh = Mock()
+        sh.worksheet.side_effect = Missing
+        module = SimpleNamespace(WorksheetNotFound=Missing, service_account_from_dict=Mock())
+        module.service_account_from_dict.return_value.open_by_key.return_value = sh
+        with TemporaryDirectory() as d, patch.dict('os.environ', {'SHEET_ID': 'x', 'GCP_SA_KEY': '{}', 'SHEET_TAB': ''}), patch.dict(sys.modules, {'gspread': module}):
+            data = r.summary([row()])
+            r.save('meta_summary_daily_v2', r.SUMMARY_HEADER, data, {('a','2026-10-01')}, r.SUMMARY_DIMS, False, Path(d))
+            with self.assertRaisesRegex(ValueError, 'meta_daily'):
+                r.save('meta_campaign_daily_v2', r.SUMMARY_HEADER, data, {('a','2026-10-01')}, r.SUMMARY_DIMS, False, Path(d))
+        sh.add_worksheet.assert_not_called()
+
     def test_naver_has_no_demographic_or_calculated_columns(self):
         self.assertEqual(n.REPORTS,('campaign','search','media'))
         self.assertEqual(n.METRICS,r.METRICS)
