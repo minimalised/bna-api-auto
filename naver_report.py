@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Naver Search Ads → 5 RAW tabs. See README.md for API coverage limits.
+"""Naver Search Ads → summary, campaign, search, media RAW tabs. See README.md for API coverage limits.
 No credentials at import time. Python 3.10+, gspread 6.x for sheet writes.
 """
 import argparse
@@ -23,17 +23,15 @@ from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
 BASE_URL = 'https://api.searchad.naver.com'
-REPORTS = ('campaign', 'search', 'media', 'gender', 'age')
+REPORTS = ('campaign', 'search', 'media')
 DIMS = {
-    'campaign': ['일별', '캠페인 유형', '캠페인'],
-    'search': ['일별', '캠페인 유형', '캠페인', '광고그룹', '검색어'],
-    'media': ['일별', '캠페인 유형', '캠페인', '광고그룹', 'PC/모바일 매체', '검색/콘텐츠 매체'],
-    'gender': ['일별', '캠페인 유형', '캠페인', '광고그룹', '성별'],
-    'age': ['일별', '캠페인 유형', '캠페인', '광고그룹', '연령대'],
+    'campaign': ['날짜', '광고상품', '캠페인명'],
+    'search': ['날짜', '광고상품', '캠페인명', '광고그룹명', '검색어'],
+    'media': ['날짜', '광고상품', '캠페인명', '광고그룹명', 'PC/모바일 매체', '검색/콘텐츠 매체'],
 }
-METRICS = ['노출수', '클릭수', '총비용', '구매완료 전환수', '구매완료 전환매출액', '평균노출순위']
+METRICS = ['노출수', '클릭수', '비용', '전환수', '전환매출액']
 META = ['계정ID', '캠페인ID', '광고그룹ID', '데이터출처', '비고', '수집시각']
-FIELDS = ['impCnt', 'clkCnt', 'salesAmt', 'purchaseCcnt', 'purchaseConvAmt', 'avgRnk']
+FIELDS = ['impCnt', 'clkCnt', 'salesAmt', 'purchaseCcnt', 'purchaseConvAmt']
 TYPES = {'WEB_SITE': '파워링크', 'SHOPPING': '쇼핑검색', 'BRAND_SEARCH': '브랜드검색',
          'POWER_CONTENTS': '파워컨텐츠', 'PLACE': '플레이스'}
 # Official positional TSV schemas. A changed column count is a hard error.
@@ -213,11 +211,7 @@ def stats_data(response):
 def metric_values(s):
     # Missing purchase metrics must NEVER fall back to total conversions or zero.
     v = [number(s[f]) for f in FIELDS[:5]]
-    rank = s.get('avgRnk')
-    rank = number(rank) if rank not in (None, '', '-') else ''
-    if rank == 0:
-        rank = ''
-    return dict(zip(METRICS, v + [rank]))
+    return dict(zip(METRICS, v))
 
 
 class Collector:
@@ -264,8 +258,8 @@ class Collector:
             notes.append('캠페인 메타정보 없음(ID 유지)')
         if gid and not g:
             notes.append('광고그룹 메타정보 없음(ID 유지)')
-        return {'일별': day, '캠페인 유형': TYPES.get(tp, tp or '미확인'),
-                '캠페인': c.get('name', cid), '광고그룹': g.get('name', gid),
+        return {'날짜': day, '광고상품': TYPES.get(tp, tp or '미확인'),
+                '캠페인명': c.get('name', cid), '광고그룹명': g.get('name', gid),
                 '계정ID': self.customer, '캠페인ID': cid, '광고그룹ID': gid,
                 '데이터출처': source, '비고': '; '.join(notes),
                 '수집시각': datetime.now(KST).isoformat(timespec='seconds')}
@@ -289,43 +283,6 @@ class Collector:
                 r = self.base(day, cid, source='stats')
                 r.update(metric_values(s))
                 out.append(r)
-        return out
-
-    def demographic(self, day, report):
-        breakdown, label = ('genderNm', '성별') if report == 'gender' else ('ageRangeNm', '연령대')
-        shopping = {k for k,v in self.campaigns.items() if v.get('campaignTp') == 'SHOPPING'}
-        if shopping.intersection(self.group_errors):
-            raise ValueError('쇼핑검색 광고그룹 목록 조회 실패: 기존 데이터 보존')
-        out = []
-        for gid, g in self.groups.items():
-            cid = g.get('nccCampaignId')
-            if cid not in shopping:
-                continue
-            entries = self.stat(gid, day, breakdown)
-            if len(entries) > 1:
-                raise ValueError('성별/연령 요약 응답이 예상과 다름')
-            seen = set()
-            for s in entries:
-                if s.get('id', gid) != gid:
-                    raise ValueError('광고그룹 stats ID 불일치')
-                splits = s.get('breakdowns')
-                if splits is None or splits == []:
-                    vals = metric_values(s)
-                    if any(vals[m] != 0 for m in METRICS[:5]):
-                        raise ValueError(f'{breakdown} 상세 누락: 전체 합계를 세부 데이터로 저장하지 않음')
-                    continue
-                if not isinstance(splits, list):
-                    raise ValueError('breakdowns 배열 형식 오류')
-                for b in splits:
-                    name = b.get('name')
-                    if name in (None, '') or str(name) in seen:
-                        raise ValueError('breakdown 구분값 누락/중복')
-                    seen.add(str(name))
-                    r = self.base(day, cid, gid, 'stats:' + breakdown)
-                    r[label] = str(name)
-                    r.update(metric_values(b))
-                    r['비고'] = '쇼핑검색만 수집; 최근 7일 재조회; 그 외 캠페인 미포함'
-                    out.append(r)
         return out
 
     def bulk(self, report, day):
@@ -374,7 +331,7 @@ class Collector:
             classification = self.media.get(r['media'], '분류미확인:' + r['media'])
             return r['campaign'], r['group'], dev, classification
         return self.aggregate(day, perf, conv, key, ['PC/모바일 매체', '검색/콘텐츠 매체'],
-                              'AD+AD_CONVERSION+Media', purchase=True, rank=True)
+                              'AD+AD_CONVERSION+Media', purchase=True, rank=False)
 
     def search(self, day):
         # Separate source streams: never fabricate Powerlink conversions from registered keywords.
@@ -383,9 +340,9 @@ class Collector:
                                'EXPKEYWORD', purchase=False, rank=False)
         shop = self.aggregate(day, self.bulk('SHOPPINGKEYWORD_DETAIL', day),
                               self.bulk('SHOPPINGKEYWORD_CONVERSION_DETAIL', day), key, ['검색어'],
-                              'SHOPPINGKEYWORD_DETAIL+SHOPPINGKEYWORD_CONVERSION_DETAIL', purchase=True, rank=True)
+                              'SHOPPINGKEYWORD_DETAIL+SHOPPINGKEYWORD_CONVERSION_DETAIL', purchase=True, rank=False)
         for r in power:
-            r['비고'] = (r['비고'] + '; 파워링크 검색어: 구매완료 전환수·매출액·평균노출순위 API 미제공').strip('; ')
+            r['비고'] = (r['비고'] + '; 파워링크 검색어: 전환수·매출액 API 미제공').strip('; ')
         for r in shop:
             r['비고'] = (r['비고'] + '; 검색어가 있는 검색 지면만 집계').strip('; ')
         return power + shop
@@ -412,10 +369,9 @@ class Collector:
         for k, b in totals.items():
             r = self.base(day, k[0], k[1], source)
             r.update(zip(labels, k[2:]))
-            r.update({'노출수': b['imp'], '클릭수': b['click'], '총비용': number(b['cost']),
-                      '구매완료 전환수': b['conv'] if purchase else '',
-                      '구매완료 전환매출액': number(b['revenue']) if purchase else '',
-                      '평균노출순위': round(b['rank'] / b['imp'], 2) if rank and b['imp'] and b['rank'] else ''})
+            r.update({'노출수': b['imp'], '클릭수': b['click'], '비용': number(b['cost']),
+                      '전환수': b['conv'] if purchase else '',
+                      '전환매출액': number(b['revenue']) if purchase else ''})
             if any(str(v).startswith('분류미확인:') for v in k):
                 r['비고'] += '; 매체 분류 확인 필요'
             out.append(r)
@@ -428,14 +384,14 @@ def header(report):
 
 def row_key(r, report):
     extras = DIMS[report][4:] if report != 'campaign' else []
-    return tuple(str(r.get(c, '')) for c in ['계정ID', '일별', '캠페인ID', '광고그룹ID'] + extras)
+    return tuple(str(r.get(c, '')) for c in ['계정ID', '날짜', '캠페인ID', '광고그룹ID'] + extras)
 
 
 def merge_rows(old, new, scopes, report):
-    # Scope = account/day; campaign and demographic reports additionally scope to queried entities.
+    # Scope = account/day; campaign reports additionally scope to queried entities.
     # Commit only after ALL required calls for that report/day succeed.
     def covered(r):
-        key = tuple(str(r.get(c, '')) for c in ['계정ID', '일별', '캠페인ID', '광고그룹ID'])
+        key = tuple(str(r.get(c, '')) for c in ['계정ID', '날짜', '캠페인ID', '광고그룹ID'])
         return any(key[:length] in scopes for length in (2, 3, 4))
     kept = [r for r in old if not covered(r)]
     out = kept + new
@@ -445,44 +401,16 @@ def merge_rows(old, new, scopes, report):
         if k in seen:
             raise ValueError(f'{report}: 중복 키 발견. 쓰기 중단')
         seen.add(k)
-    return sorted(out, key=lambda r: (str(r['일별']), str(r['계정ID']), str(r['캠페인ID']), str(r.get('광고그룹ID', ''))), reverse=True)
+    return sorted(out, key=lambda r: (str(r['날짜']), str(r['계정ID']), str(r['캠페인ID']), str(r.get('광고그룹ID', ''))), reverse=True)
 
 
 class SheetWriter:
-    def __init__(self):
-        import gspread
-        self.gspread = gspread
-        self.sh = gspread.service_account_from_dict(json.loads(env('GCP_SA_KEY'))).open_by_key(env('SHEET_ID'))
-
     def write(self, report, rows, scopes, outdir):
-        tab = env('NAVER_RAW_PREFIX', 'naver_raw') + '_' + report
-        h = header(report)
-        try:
-            ws = self.sh.worksheet(tab)
-            values = ws.get_values(value_render_option='UNFORMATTED_VALUE')
-            if values and values[0] != h:
-                raise ValueError(f'{tab}: 기존 헤더가 다릅니다. 새 NAVER_RAW_PREFIX로 먼저 실행하세요.')
-            old = [dict(zip(h, v + [''] * (len(h) - len(v)))) for v in values[1:] if any(v)] if values else []
-        except self.gspread.WorksheetNotFound:
-            ws, old = None, []
-        merged = merge_rows(old, rows, scopes, report)
-        if ws is not None:
-            write_csv(outdir / f'before_{report}.csv', h, old)
-        if ws is None:
-            ws = self.sh.add_worksheet(title=tab, rows=max(1000, len(merged) + 1), cols=len(h))
-        needed_rows = max(ws.row_count, len(merged) + 1)
-        needed_cols = max(ws.col_count, len(h))
-        # Reserve enough grid space before writing. Never shrink/clear first.
-        if needed_rows != ws.row_count or needed_cols != ws.col_count:
-            ws.resize(rows=needed_rows, cols=needed_cols)
-        grid = [h] + [[r.get(c, '') for c in h] for r in merged]
-        for start in range(0, len(grid), 3000):
-            ws.update(range_name=f'A{start+1}', values=grid[start:start+3000], value_input_option='RAW')
-        old_count = len(old) + 1
-        if old_count > len(grid):
-            ws.batch_clear([f'A{len(grid)+1}:{colname(len(h))}{old_count}'])
-        ws.freeze(rows=1)
-        print(f'{tab}: {len(merged)}행 적재', flush=True)
+        from raw_store import save
+        save('naver_' + report + '_daily_v2', header(report), rows,
+             {(str(x[0]), str(x[1])) for x in scopes},
+             ['계정ID', '날짜', '캠페인ID', '광고그룹ID'] + (DIMS[report][4:] if report != 'campaign' else []),
+             False, outdir)
 
 
 def colname(n):
@@ -505,7 +433,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--since')
     p.add_argument('--until')
-    p.add_argument('--lookback-days', type=int, default=14)
+    p.add_argument('--lookback-days', type=int, default=1)
     p.add_argument('--reports', default=','.join(REPORTS))
     p.add_argument('--dry-run', action='store_true', help='API 수집+CSV 생성만, 시트 변경 없음')
     p.add_argument('--list-accounts', action='store_true')
@@ -522,7 +450,7 @@ def main():
         p.error('이 버전은 VAT 기준 통일을 위해 2026-03-30 이후만 지원합니다.')
     selected = list(dict.fromkeys(x.strip() for x in args.reports.split(',') if x.strip()))
     if not selected or set(selected) - set(REPORTS):
-        p.error('--reports: campaign,search,media,gender,age 중 선택')
+        p.error('--reports: campaign,search,media 중 선택')
     owner = env('NAVER_CUSTOMER_ID')
     customers = list(dict.fromkeys(c.strip() for c in env('NAVER_CUSTOMER_IDS', owner).split(',') if c.strip()))
     client = Client()
@@ -532,14 +460,13 @@ def main():
             print(f'{customer}: 캠페인 {len(c.campaigns)}개')
         return 0
     runid = datetime.now(KST).strftime('%Y%m%dT%H%M%S')
-    outdir = Path('reports') / f'naver_raw5_{runid}'
+    outdir = Path('reports') / f'naver_raw_v2_{runid}'
     outdir.mkdir(parents=True, exist_ok=True)
     result = {r: [] for r in selected}
     scopes = {r: set() for r in selected}
     status = []
     errors = []
-    cutoff = (today - timedelta(days=7)).isoformat()
-    print('범위: 성별/연령=쇼핑검색 최근 7일; 검색어=파워링크+쇼핑검색. 미제공 지표는 빈칸.', flush=True)
+    print('범위: 캠페인·검색어·매체 RAW. 구매만 집계하며 미제공 지표는 빈칸.', flush=True)
     for customer in customers:
         try:
             collector = Collector(client, customer)
@@ -550,38 +477,30 @@ def main():
             continue
         for day in days(since, until):
             for report in selected:
-                if report in ('gender', 'age') and day < cutoff:
-                    status.append({'계정ID': customer, '일별': day, '보고서': report,
-                                   '상태': '기간제한_미조회', '행수': 0, '설명': '최근 7일만 재조회, 기존 행 유지'})
-                    continue
                 try:
                     method = {'campaign': collector.campaign, 'search': collector.search,
                               'media': collector.media_report}.get(report)
-                    rows = method(day) if method else collector.demographic(day, report)
+                    rows = method(day)
                     # Validate keys before treating a day as replaceable.
                     merge_rows([], rows, set(), report)
                     result[report].extend(rows)
                     if report == 'campaign':
                         scopes[report].update((customer, day, cid) for cid in collector.campaigns)
-                    elif report in ('gender', 'age'):
-                        scopes[report].update((customer, day, g['nccCampaignId'], gid)
-                            for gid, g in collector.groups.items()
-                            if collector.campaigns.get(g.get('nccCampaignId'), {}).get('campaignTp') == 'SHOPPING')
                     else:
                         scopes[report].add((customer, day))
-                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                    status.append({'계정ID': customer, '날짜': day, '보고서': report,
                                    '상태': '수집성공', '행수': len(rows), '설명': '문서의 지원 범위 내 수집'})
                     print(f'{customer} {day} {report}: {len(rows)}행', flush=True)
                 except Exception as e:
                     msg = f'{customer} {day} {report}: {e}'
                     errors.append(msg)
-                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                    status.append({'계정ID': customer, '날짜': day, '보고서': report,
                                    '상태': '실패_기존보존', '행수': 0, '설명': str(e)})
                     print(msg, file=sys.stderr, flush=True)
             collector.cache.clear()
     for report in selected:
         write_csv(outdir / f'{report}.csv', header(report), result[report])
-    write_csv(outdir / 'collection_status.csv', ['계정ID', '일별', '보고서', '상태', '행수', '설명'], status)
+    write_csv(outdir / 'collection_status.csv', ['계정ID', '날짜', '보고서', '상태', '행수', '설명'], status)
     if not args.dry_run:
         try:
             writer = SheetWriter()
@@ -593,9 +512,19 @@ def main():
                         errors.append(f'{report}: 시트 쓰기 실패 ({type(e).__name__}): 헤더/권한/용량 확인')
         except Exception as e:
             errors.append(f'시트 연결 실패 ({type(e).__name__}): 인증/권한 확인')
-    summary = ['### 네이버 RAW 5종 수집', f'기간: {since} ~ {until}',
-               '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만.',
-               '파워링크 검색어 전환수/매출/평균순위는 미제공(빈칸).',
+    if 'campaign' in selected:
+        from raw_store import summary as make_summary, save, SUMMARY_HEADER, SUMMARY_DIMS
+        normalized = [dict(r, 매체='naver', 계정명='', 통화='KRW', 전환기준='구매', 클릭기준='클릭')
+                      for r in result['campaign']]
+        try:
+            save('naver_summary_daily_v2', SUMMARY_HEADER, make_summary(normalized),
+                 {(str(x[0]), str(x[1])) for x in scopes['campaign']},
+                 SUMMARY_DIMS, args.dry_run, outdir)
+        except Exception as e:
+            errors.append(f'summary 저장 실패: {type(e).__name__}: {e}')
+    summary = ['### 네이버 RAW 수집', f'기간: {since} ~ {until}',
+               '검색어: 파워링크·쇼핑검색만. 성별·연령은 수집하지 않음.',
+               '파워링크 검색어 전환수/매출는 미제공(빈칸).',
                '| RAW | 성공 계정·날짜 | 행수 |', '|---|---:|---:|']
     summary += [f'| {r} | {len({s[:2] for s in scopes[r]})} | {len(result[r])} |' for r in selected]
     summary += [f'오류 {len(errors)}건. 상세: collection_status.csv',

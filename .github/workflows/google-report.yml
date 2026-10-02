@@ -6,18 +6,22 @@ on:
   workflow_dispatch:
     inputs:
       since:
-        description: "시작일 (YYYY-MM-DD, 비우면 최근 30일)"
+        description: "시작일 (YYYY-MM-DD, 비우면 전일자)"
         required: false
       until:
         description: "종료일 (YYYY-MM-DD, 비우면 시작일과 동일)"
         required: false
+      dry_run:
+        description: "API 조회·CSV만 생성 (시트 변경 없음)"
+        type: boolean
+        default: true
       list_accounts:
         description: "MCC 하위 계정 ID 목록만 출력"
         type: boolean
         default: false
 
 concurrency:
-  group: sheet-write-google   # 같은 탭 동시 쓰기 방지
+  group: sheet-write-ads-raw-v2   # 같은 탭 동시 쓰기 방지
 
 jobs:
   report:
@@ -45,12 +49,18 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           IN_SINCE: ${{ inputs.since }}
           IN_UNTIL: ${{ inputs.until }}
+          IN_EVENT: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
           IN_LIST: ${{ inputs.list_accounts }}
         run: |
+          set -euo pipefail
           ARGS=()
           [ -n "$IN_SINCE" ] && ARGS+=(--since "$IN_SINCE")
           [ -n "$IN_UNTIL" ] && ARGS+=(--until "$IN_UNTIL")
           [ "$IN_LIST" = "true" ] && ARGS+=(--list-accounts)
+          if [[ "$IN_EVENT" != "schedule" && "${IN_DRY_RUN:-true}" != "false" ]]; then
+            ARGS+=(--dry-run)
+          fi
           python google_report.py "${ARGS[@]}"
 
       - name: Upload CSV

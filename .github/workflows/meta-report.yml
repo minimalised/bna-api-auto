@@ -6,15 +6,23 @@ on:
   workflow_dispatch:
     inputs:
       since:
-        description: "시작일 (YYYY-MM-DD, 비우면 최근 7일)"
+        description: "시작일 (YYYY-MM-DD, 비우면 전일자)"
         required: false
       until:
         description: "종료일 (YYYY-MM-DD, 비우면 시작일과 동일)"
         required: false
+      dry_run:
+        description: "API 조회·CSV만 생성 (시트 변경 없음)"
+        type: boolean
+        default: true
       list_actions:
         description: "action_type 목록 출력"
         type: boolean
         default: false
+
+concurrency:
+  group: sheet-write-ads-raw-v2
+  cancel-in-progress: false
 
 jobs:
   report:
@@ -36,14 +44,20 @@ jobs:
           META_ACCOUNT_IDS: ${{ secrets.META_ACCOUNT_IDS }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          IN_EVENT: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
           IN_SINCE: ${{ inputs.since }}
           IN_UNTIL: ${{ inputs.until }}
           IN_LIST: ${{ inputs.list_actions }}
         run: |
+          set -euo pipefail
           ARGS=()
           [ -n "$IN_SINCE" ] && ARGS+=(--since "$IN_SINCE")
           [ -n "$IN_UNTIL" ] && ARGS+=(--until "$IN_UNTIL")
           [ "$IN_LIST" = "true" ] && ARGS+=(--list-actions)
+          if [[ "$IN_EVENT" != "schedule" && "${IN_DRY_RUN:-true}" != "false" ]]; then
+            ARGS+=(--dry-run)
+          fi
           python meta_report.py "${ARGS[@]}"
 
       - name: Upload CSV
