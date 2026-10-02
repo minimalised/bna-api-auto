@@ -11,15 +11,15 @@
 | 네이버 | 검색어 RAW | naver_raw_search |
 | 네이버 | 매체 RAW | naver_raw_media |
 | 메타 | 캠페인 RAW | meta_daily |
+| 메타 | 광고·소재 RAW | meta_ad_daily |
 | 구글 | 캠페인 RAW | google_daily |
 
 네이버는 NAVER_RAW_PREFIX, 메타는 SHEET_TAB, 구글은 GOOGLE_SHEET_TAB으로 기존 탭 이름을 지정할 수 있습니다.
 기본값은 위 표와 같습니다. 모든 보고서는 기존 SHEET_ID의 스프레드시트를 사용합니다.
 
-기존 summary 탭(naver_summary_daily, meta_summary_daily, google_summary_daily)과
-메타 광고 RAW 탭(meta_ad_daily)이 있으면 해당 탭에 저장합니다.
-없으면 CSV만 생성하며 탭을 자동으로 만들지 않습니다.
-기존 캠페인/검색어/매체 탭이 없으면 이름을 확인하도록 오류를 내고 새 탭 생성은 하지 않습니다.
+메타 광고·소재 RAW는 기존 meta_ad_daily 탭을 사용합니다(META_AD_SHEET_TAB으로 지정 가능).
+합계 RAW는 네이버 3종, 메타 2종, 구글 1종입니다. summary는 CSV만 생성하고 시트에 저장하지 않습니다.
+필요한 기존 RAW 탭이 없으면 이름을 확인하도록 오류를 내고 새 탭 생성은 하지 않습니다.
 이미 생성된 버전별 탭을 자동 삭제하지 않습니다.
 
 ## 업데이트와 이력
