@@ -286,6 +286,9 @@ class Collector:
         p = {'id': entity, 'fields': json.dumps(FIELDS),
              'timeRange': json.dumps({'since': day, 'until': day}), 'timeIncrement': 'allDays'}
         if breakdown:
+            # Use the documented multi-entity summary route with one entity.
+            # Keep each demographic dimension in its own request.
+            p['ids'] = p.pop('id')
             p['breakdown'] = breakdown
         response = self.client.get('/stats', self.customer, p)
         if breakdown:
@@ -293,7 +296,7 @@ class Collector:
             logged = getattr(self, '_logged_breakdown_shapes', set())
             if breakdown not in logged:
                 print('성별/연령 응답 진단: ' + json.dumps({
-                    'breakdown': breakdown, 'timeIncrement': p['timeIncrement'],
+                    'breakdown': breakdown, 'entity_parameter': 'ids', 'timeIncrement': p['timeIncrement'],
                     'fields': FIELDS, 'response_shape': response_shape(response),
                 }, ensure_ascii=False), flush=True)
                 logged.add(breakdown)
