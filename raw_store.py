@@ -78,6 +78,8 @@ ALIASES = {
 def existing_tab(tab):
     if tab == 'meta_campaign_daily_v2':
         return os.getenv('SHEET_TAB', '').strip() or 'meta_daily', True
+    if tab == 'meta_ad_daily_v2':
+        return os.getenv('META_AD_SHEET_TAB', '').strip() or 'meta_ad_daily', True
     if tab == 'google_campaign_daily_v2':
         return os.getenv('GOOGLE_SHEET_TAB', '').strip() or 'google_daily', True
     for report in ('campaign', 'search', 'media'):
@@ -104,6 +106,8 @@ def save(tab, header, rows, scopes, keys, dry_run, outdir):
     # Validate before exporting or opening a sheet; no legacy header union.
     merge([], rows, set(), keys)
     csv_write(outdir / (tab + '.csv'), header, rows)
+    if '_summary_' in tab:
+        return  # Summary is a CSV artifact only; the agreed sheet scope is six RAW reports.
     if dry_run or not os.getenv('SHEET_ID') or not scopes:
         return
     tab, required = existing_tab(tab)
