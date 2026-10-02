@@ -198,6 +198,18 @@ class Client:
         raise RuntimeError('보고서 데이터 변경으로 재생성 필요')
 
 
+def response_shape(value, depth=0):
+    """Log structure only: never emit account IDs, names, or metric values."""
+    if depth >= 5:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {str(k): response_shape(v, depth + 1)
+                for k, v in list(value.items())[:40]}
+    if isinstance(value, list):
+        return {'count': len(value), 'first': response_shape(value[0], depth + 1) if value else None}
+    return type(value).__name__
+
+
 def stats_data(response):
     if not isinstance(response, dict):
         raise ValueError('stats 응답 형식 오류')
@@ -274,8 +286,22 @@ class Collector:
         p = {'id': entity, 'fields': json.dumps(FIELDS),
              'timeRange': json.dumps({'since': day, 'until': day}), 'timeIncrement': 'allDays'}
         if breakdown:
+            # Use the documented multi-entity summary route with one entity.
+            # Keep each demographic dimension in its own request.
+            p['ids'] = p.pop('id')
             p['breakdown'] = breakdown
-        return stats_data(self.client.get('/stats', self.customer, p))
+        response = self.client.get('/stats', self.customer, p)
+        if breakdown:
+            # Independent calls: genderNm and ageRangeNm are never combined.
+            logged = getattr(self, '_logged_breakdown_shapes', set())
+            if breakdown not in logged:
+                print('성별/연령 응답 진단: ' + json.dumps({
+                    'breakdown': breakdown, 'entity_parameter': 'ids', 'timeIncrement': p['timeIncrement'],
+                    'fields': FIELDS, 'response_shape': response_shape(response),
+                }, ensure_ascii=False), flush=True)
+                logged.add(breakdown)
+                self._logged_breakdown_shapes = logged
+        return stats_data(response)
 
     def campaign(self, day):
         out = []
