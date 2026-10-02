@@ -2,7 +2,7 @@ name: Naver SearchAd Daily Report
 
 on:
   schedule:
-    - cron: "20 23 * * *"   # 매일 08:20 KST: 전체 RAW, 최근 14일, 시트 적재
+    - cron: "20 23 * * *"   # 매일 08:20 KST: RAW, 전일자, 시트 적재
   workflow_dispatch:
     inputs:
       since:
@@ -14,7 +14,7 @@ on:
         type: string
         required: false
       lookback_days:
-        description: "수동 실행 조회 일수 (성별·연령은 최대 최근 7일)"
+        description: "수동 재조회 일수 (기본 전일자)"
         type: choice
         options:
           - "1"
@@ -22,15 +22,13 @@ on:
           - "14"
         default: "1"
       reports:
-        description: "수집 RAW (all=5종, 지원 범위는 Python 안내 참고)"
+        description: "수집 RAW (all=캠페인·검색어·매체 + summary, 지원 범위는 Python 안내 참고)"
         type: choice
         options:
           - all
           - campaign
           - search
           - media
-          - gender
-          - age
         default: all
       dry_run:
         description: "테스트: API 조회·CSV 생성만 수행, 시트 변경 안 함"
@@ -45,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sheet-write-naver
+  group: sheet-write-ads-raw-v2
   cancel-in-progress: false
 
 jobs:
@@ -80,7 +78,6 @@ jobs:
           NAVER_CUSTOMER_IDS: ${{ secrets.NAVER_CUSTOMER_IDS }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          NAVER_RAW_PREFIX: naver_raw
           NAVER_REPORT_TIMEOUT: "600"
           IN_EVENT: ${{ github.event_name }}
           IN_SINCE: ${{ inputs.since }}
@@ -93,8 +90,8 @@ jobs:
           set -euo pipefail
           ARGS=()
           if [[ "$IN_EVENT" == "schedule" ]]; then
-            # 정기 실행은 수동 입력 기본값과 무관하게 최근 14일·전체 RAW를 시트에 적재
-            ARGS+=(--lookback-days 14)
+            # 정기 실행은 수동 입력 기본값과 무관하게 전일자 RAW를 시트에 적재
+            ARGS+=(--lookback-days 1)
           elif [[ "$IN_LIST" == "true" ]]; then
             ARGS+=(--list-accounts)
           else
