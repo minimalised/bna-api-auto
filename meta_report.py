@@ -8,6 +8,7 @@ Meta Ads 인사이트 → 구글 시트 적재 (최근 N일 upsert) + CSV 백업
   GCP_SA_KEY         : 서비스 계정 JSON 키 내용 (시트 적재 시 필수)
   SHEET_ID           : 구글 시트 ID (없으면 CSV만 저장)
   SHEET_TAB          : 적재할 탭 이름 (기본 meta_daily)
+  META_BREAKDOWN_TAB : 성별·연령·기기 탭 이름 (기본 meta_breakdown)
   META_API_VERSION   : 기본 v24.0
 
 사용법
@@ -88,7 +89,7 @@ def api_get(url, params=None, max_retry=5):
     raise RuntimeError("재시도 횟수 초과")
 
 
-def fetch_insights(account_id, token, since, until):
+def fetch_insights(account_id, token, since, until, breakdowns=None):
     url = f"{BASE_URL}/{account_id}/insights"
     params = {
         "access_token": token,
@@ -99,6 +100,8 @@ def fetch_insights(account_id, token, since, until):
         "action_attribution_windows": '["7d_click","1d_view"]',
         "limit": 500,
     }
+    if breakdowns:
+        params["breakdowns"] = breakdowns
     rows = []
     while url:
         data = api_get(url, params)
@@ -158,6 +161,43 @@ def build_row(d):
     return row
 
 
+GENDER = {"male": "남성", "female": "여성"}
+DEVICE = {"desktop": "PC", "mobile": "모바일", "mobile_app": "모바일", "mobile_web": "모바일"}
+
+
+def breakdown_rows(raw, dims):
+    """breakdown 응답 → (차원, 값) 행. 성별×연령 교차 응답은 성별·연령 각각으로 합산."""
+    agg = {}
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    for d in raw:
+        cur = d.get("account_currency") or ""
+        vals = {"노출수": num(d.get("impressions"), int), "링크클릭수": num(d.get("inline_link_clicks"), int),
+                "광고비": num(d.get("spend")), "구매": pick(d.get("actions"), CONVERSIONS["구매"]),
+                "구매가치": pick(d.get("action_values"), PURCHASE_VALUE_TYPE)}
+        for dim, field, mapping in dims:
+            raw_value = str(d.get(field) or "unknown")
+            value = mapping(raw_value)
+            key = (d.get("date_start"), str(d.get("account_id") or ""), str(d.get("campaign_id") or ""), dim, value)
+            row = agg.setdefault(key, {
+                "날짜": key[0], "계정ID": key[1], "계정명": d.get("account_name"), "캠페인ID": key[2],
+                "캠페인명": d.get("campaign_name"), "통화": cur, "차원": dim, "값": value,
+                "노출수": 0, "링크클릭수": 0, "광고비": 0.0, "구매": 0.0, "구매가치": 0.0, "수집시각": now})
+            for k, v in vals.items():
+                row[k] += v
+    for row in agg.values():
+        row["광고비"] = money(row["광고비"], row["통화"])
+        row["구매가치"] = money(row["구매가치"], row["통화"])
+        row["구매"] = int(row["구매"])
+    return list(agg.values())
+
+
+BREAKDOWNS = [
+    ("age,gender", [("성별", "gender", lambda v: GENDER.get(v, "알수없음")),
+                    ("연령", "age", lambda v: v if v[:1].isdigit() else "알수없음")]),
+    ("device_platform", [("기기", "device_platform", lambda v: DEVICE.get(v, "기타"))]),
+]
+
+
 def list_actions(raw_rows):
     counts = defaultdict(float)
     for d in raw_rows:
@@ -169,14 +209,14 @@ def list_actions(raw_rows):
 
 
 # ───────────────────────── 구글 시트 ─────────────────────────
-def upsert_sheet(new_rows, since, until, done_accounts):
+def upsert_sheet(new_rows, since, until, done_accounts, tab=None):
     """기간(since~until) × 성공한 계정의 기존 행을 지우고 새 행으로 교체"""
     import gspread
 
     key = json.loads(get_env("GCP_SA_KEY"))
     gc = gspread.service_account_from_dict(key)
     sh = gc.open_by_key(get_env("SHEET_ID"))
-    tab = os.getenv("SHEET_TAB", "meta_daily").strip() or "meta_daily"
+    tab = tab or os.getenv("SHEET_TAB", "meta_daily").strip() or "meta_daily"
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -277,6 +317,27 @@ def main():
         upsert_sheet(rows, since, until, done)
     elif not get_env("SHEET_ID", required=False):
         print("SHEET_ID 없음 → 시트 적재 건너뜀")
+
+    # 성별·연령·기기: 대시보드 분석용. 실패해도 기본 데이터는 그대로 두고 경고만 남김
+    brk_rows, brk_done = [], []
+    for acc in done:
+        try:
+            got = []
+            for fields, dims in BREAKDOWNS:
+                got += breakdown_rows(fetch_insights(acc, token, since, until, fields), dims)
+            brk_rows += got
+            brk_done.append(acc)
+            print(f"  ✓ {acc} 성별·연령·기기: {len(got)}행")
+        except Exception as e:
+            print(f"::warning::{acc} 성별·연령·기기 수집 실패: {e}")
+    if brk_rows:
+        Path("reports").mkdir(exist_ok=True)
+        with open(Path("reports") / f"meta_breakdown_{since}_{until}.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=brk_rows[0].keys())
+            w.writeheader()
+            w.writerows(brk_rows)
+    if get_env("SHEET_ID", required=False) and brk_done:
+        upsert_sheet(brk_rows, since, until, brk_done, os.getenv("META_BREAKDOWN_TAB", "").strip() or "meta_breakdown")
 
     if failed:
         sys.exit(f"실패 계정: {', '.join(failed)}")

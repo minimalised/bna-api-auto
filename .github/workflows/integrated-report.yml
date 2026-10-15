@@ -1,0 +1,60 @@
+name: Integrated Media Report
+
+on:
+  # 매체 리포트가 끝날 때마다 통합 탭 갱신 (정기 실행 시각이 밀려도 순서가 보장됨)
+  workflow_run:
+    workflows:
+      - Meta Ads Daily Report
+      - Google Ads Daily Report
+      - Naver SearchAd Daily Report
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "테스트: 집계 CSV만 생성, 통합 탭 변경 안 함"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sheet-write-integrated
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: python -m pip install "gspread>=6.0"
+
+      - name: Build integrated report tabs
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ARGS=()
+          [ "$IN_DRY_RUN" = "true" ] && ARGS+=(--dry-run)
+          python integrated_report.py "${ARGS[@]}"
+
+      - name: Upload CSV
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: integrated-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
