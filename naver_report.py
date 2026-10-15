@@ -22,6 +22,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
+
+
+class Unsupported(ValueError):
+    """API가 해당 세부 구분을 내려주지 않음: 실패가 아니라 미제공으로 기록."""
 BASE_URL = 'https://api.searchad.naver.com'
 REPORTS = ('campaign', 'search', 'media', 'gender', 'age')
 DIMS = {
@@ -312,7 +316,7 @@ class Collector:
                 if splits is None or splits == []:
                     vals = metric_values(s)
                     if any(vals[m] != 0 for m in METRICS[:5]):
-                        raise ValueError(f'{breakdown} 상세 누락: 전체 합계를 세부 데이터로 저장하지 않음')
+                        raise Unsupported(f'{breakdown} 상세 미제공: 전체 합계를 세부 데이터로 저장하지 않음')
                     continue
                 if not isinstance(splits, list):
                     raise ValueError('breakdowns 배열 형식 오류')
@@ -572,6 +576,10 @@ def main():
                     status.append({'계정ID': customer, '일별': day, '보고서': report,
                                    '상태': '수집성공', '행수': len(rows), '설명': '문서의 지원 범위 내 수집'})
                     print(f'{customer} {day} {report}: {len(rows)}행', flush=True)
+                except Unsupported as e:
+                    status.append({'계정ID': customer, '일별': day, '보고서': report,
+                                   '상태': '미제공_기존보존', '행수': 0, '설명': str(e)})
+                    print(f'{customer} {day} {report}: {e} (건너뜀)', flush=True)
                 except Exception as e:
                     msg = f'{customer} {day} {report}: {e}'
                     errors.append(msg)
