@@ -13,15 +13,15 @@
   광고비 · 노출수 · 클릭수 · 전환수 · 전환매출 → CTR · CPC · CPA · ROAS · 전환율
   메타: 링크클릭·구매·구매가치 / 구글: 클릭·전환·전환가치 / 네이버: 클릭·구매완료 전환·전환매출
   금액은 원화(KRW)로 통일: 달러 등 외화 계정은 USD_KRW 환율(기본 1,350원)로 환산.
-  광고비는 VAT 별도 기준으로 통일: 네이버 총비용(VAT 포함)은 1.1로 나눔. 메타·구글은 원래 VAT 별도.
-  SPEND_VAT=포함 이면 반대로 메타·구글 광고비에 1.1을 곱해 VAT 포함 기준으로 맞춤. 전환매출은 그대로.
+  광고비는 VAT 포함 기준으로 통일: 메타·구글(VAT 별도) 광고비에 1.1을 곱함. 네이버 총비용은 원래 VAT 포함.
+  SPEND_VAT=별도 이면 반대로 네이버 총비용을 1.1로 나눠 VAT 별도 기준으로 맞춤. 전환매출은 그대로.
 
 환경변수
   GCP_SA_KEY, SHEET_ID : 매체 스크립트와 같은 시트
   SHEET_TAB / GOOGLE_SHEET_TAB / NAVER_RAW_PREFIX : 매체 스크립트와 같은 탭 이름 설정
   REPORT_TAB_PREFIX    : 통합 탭 이름 앞부분 (기본 통합)
   USD_KRW              : 원화 환산 환율 (기본 1350)
-  SPEND_VAT            : 광고비 기준 별도|포함 (기본 별도)
+  SPEND_VAT            : 광고비 기준 포함|별도 (기본 포함)
 
 사용법
   python integrated_report.py                # 시트 RAW → 통합 탭 갱신
@@ -65,7 +65,7 @@ def to_krw(value, currency):
 
 
 def vat_included():
-    return env("SPEND_VAT", "별도") == "포함"
+    return env("SPEND_VAT", "포함") != "별도"
 
 
 def spend_from_net(value):
