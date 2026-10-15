@@ -1,0 +1,51 @@
+name: Cleanup sheet tabs
+
+# 수동 실행. delete를 비우면 탭 목록만 출력. 지정한 탭은 CSV 백업(90일 보관) 후 삭제.
+# 자동화가 쓰는 탭(RAW·통합)은 지정해도 지우지 않음.
+on:
+  workflow_dispatch:
+    inputs:
+      delete:
+        description: "삭제할 탭 이름 (쉼표로 구분, 비우면 목록만)"
+        required: false
+      confirm:
+        description: "삭제하려면 '삭제' 입력"
+        required: false
+  push:
+    branches: ["claude/**"]
+    paths: [".github/workflows/cleanup-tabs.yml", "cleanup_tabs.py"]
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install "gspread>=6.0"
+      - name: List or delete tabs
+        env:
+          PYTHONUTF8: "1"
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          DELETE: ${{ inputs.delete }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ -n "$DELETE" ] && [ "$CONFIRM" = "삭제" ]; then
+            python cleanup_tabs.py --delete "$DELETE" --confirm | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            python cleanup_tabs.py --delete "$DELETE" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: cleanup-backup-${{ github.run_number }}
+          path: reports/
+          retention-days: 90
+          if-no-files-found: ignore
