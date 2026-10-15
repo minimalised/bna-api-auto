@@ -132,10 +132,10 @@ def loose_day(value):
 
 def brand_search_rows(charges, rows):
     """브랜드검색 계약 결제액을 계약 기간에 하루 같은 금액으로 나눠 네이버 검색광고 비용으로 넣는다.
-    기간을 적지 않은 결제는 결제일부터 BRAND_SEARCH_DAYS일(기본 30). 데이터 마지막 날 이후 몫은 아직 넣지 않음."""
+    기간을 적지 않은 결제는 결제일부터 BRAND_SEARCH_DAYS일(기본 30). 리포트 데이터 기간(첫날~마지막 날) 밖의 몫은 넣지 않음."""
     if not charges or not rows:
         return [], []
-    last = max(r["날짜"] for r in rows)
+    first, last = min(r["날짜"] for r in rows), max(r["날짜"] for r in rows)
     default_days = int(env("BRAND_SEARCH_DAYS", "30"))
     # 비용을 붙일 캠페인: 그 계정·날짜에 노출된 브랜드검색 캠페인이 하나면 그 캠페인, 아니면 '브랜드검색'
     shown = defaultdict(set)
@@ -158,6 +158,8 @@ def brand_search_rows(charges, rows):
             d = (date.fromisoformat(start) + timedelta(days=i)).isoformat()
             if d > last:
                 break
+            if d < first:
+                continue
             names = shown.get((account, d), set())
             camp = str(c.get("캠페인") or "") or (next(iter(names)) if len(names) == 1 else "브랜드검색")
             out.append({"날짜": d, "매체": "Naver SA", "계정": account, "캠페인유형": "브랜드검색", "캠페인": camp,
