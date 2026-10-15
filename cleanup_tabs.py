@@ -25,7 +25,8 @@ def pipeline_tabs():
     naver = env("NAVER_RAW_PREFIX", "naver_raw")
     prefix = env("REPORT_TAB_PREFIX", "통합")
     return ({env("SHEET_TAB", "meta_daily"), env("GOOGLE_SHEET_TAB", "google_daily"),
-             env("META_BREAKDOWN_TAB", "meta_breakdown"), env("GOOGLE_BREAKDOWN_TAB", "google_breakdown")}
+             env("META_BREAKDOWN_TAB", "meta_breakdown"), env("GOOGLE_BREAKDOWN_TAB", "google_breakdown"),
+             env("BRAND_SEARCH_TAB", "브랜드검색_결제")}
             | {f"{naver}_{r}" for r in NAVER_REPORTS}
             | {f"{prefix}_{p}" for p in ("일별", "주간", "월간", "대시보드")})
 
