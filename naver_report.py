@@ -598,9 +598,9 @@ def main():
                     try:
                         writer.write(report, result[report], scopes[report], outdir)
                     except Exception as e:
-                        errors.append(f'{report}: 시트 쓰기 실패 ({type(e).__name__}): 헤더/권한/용량 확인')
+                        errors.append(f'{report}: 시트 쓰기 실패 ({type(e).__name__}: {str(e)[:300]})')
         except Exception as e:
-            errors.append(f'시트 연결 실패 ({type(e).__name__}): 인증/권한 확인')
+            errors.append(f'시트 연결 실패 ({type(e).__name__}: {str(e)[:300]})')
     summary = ['### 네이버 RAW 5종 수집', f'기간: {since} ~ {until}',
                '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만.',
                '파워링크 검색어 전환수/매출/평균순위는 미제공(빈칸).',
@@ -615,6 +615,8 @@ def main():
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
             f.write(text)
+    for e in errors:
+        print(f'::error::{e}', flush=True)
     print(f'결과 저장: {outdir}', flush=True)
     return 1 if errors else 0
 
