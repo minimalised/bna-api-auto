@@ -1,34 +1,33 @@
-"""브랜드검색 계약 정보가 검색광고 API로 조회되는지 확인 (읽기 전용)."""
-import json
+"""브랜드검색 계약 비용이 비즈머니 소진 내역에 잡히는지 확인 (읽기 전용)."""
+import collections
+from datetime import date, datetime, timedelta, timezone
 from naver_report import Client, env
 
+KST = timezone(timedelta(hours=9))
 c = Client()
 owner = env('NAVER_CUSTOMER_ID')
 customers = list(dict.fromkeys(x.strip() for x in env('NAVER_CUSTOMER_IDS', owner).split(',') if x.strip()))
 
-def show(label, fn):
-    try:
-        r = fn()
-        s = json.dumps(r, ensure_ascii=False)
-        print(f'[OK] {label}: {s[:3000]}')
-        return r
-    except Exception as e:
-        print(f'[FAIL] {label}: {e}')
-
 for cu in customers:
     print(f'===== 계정 {cu[-4:]} =====')
-    camps = show('campaigns(BRAND_SEARCH)', lambda: [x for x in c.get('/ncc/campaigns', cu) if x.get('campaignTp') == 'BRAND_SEARCH'])
-    for camp in camps or []:
-        cid = camp['nccCampaignId']
-        groups = show(f'adgroups {camp.get("name")}', lambda: c.get('/ncc/adgroups', cu, {'nccCampaignId': cid}))
-        for g in (groups or [])[:5]:
-            gid = g['nccAdgroupId']
-            show(f'ads {g.get("name")}', lambda: c.get('/ncc/ads', cu, {'nccAdgroupId': gid}))
-        show(f'stats {camp.get("name")}', lambda: c.get('/stats', cu, {
-            'id': cid, 'fields': json.dumps(['impCnt', 'clkCnt', 'salesAmt']),
-            'timeRange': json.dumps({'since': '2026-09-01', 'until': '2026-10-14'})}))
-    show('bizmoney', lambda: c.get('/billing/bizmoney', cu))
-    show('bizmoney exhaust', lambda: c.get('/billing/bizmoney/histories/exhaust', cu,
-         {'searchStartDt': '20260901', 'searchEndDt': '20261014'}))
-    show('bizmoney charge', lambda: c.get('/billing/bizmoney/histories/charge', cu,
-         {'searchStartDt': '20260901', 'searchEndDt': '20261014'}))
+    start = date(2026, 4, 1)
+    while start < date(2026, 10, 15):
+        end = min(start + timedelta(days=30), date(2026, 10, 14))
+        try:
+            rows = c.get('/billing/bizmoney/histories/exhaust', cu,
+                         {'searchStartDt': start.strftime('%Y%m%d'), 'searchEndDt': end.strftime('%Y%m%d')})
+        except Exception as e:
+            print(f'[FAIL] {start}~{end}: {e}')
+            start = end + timedelta(days=1)
+            continue
+        agg = collections.defaultdict(float)
+        days = collections.defaultdict(set)
+        for r in rows:
+            k = (r.get('campaignTp'), r.get('prodInfoCd'), r.get('activityCd'))
+            agg[k] += (r.get('useRefundableAmt') or 0) + (r.get('useNonrefundableAmt') or 0)
+            days[k].add(datetime.fromtimestamp(r['settleDt'] / 1000, KST).strftime('%m-%d'))
+        print(f'-- {start}~{end}: {len(rows)}건, 키 목록 {sorted(set(k for r in rows for k in r))}')
+        for k, v in sorted(agg.items(), key=lambda x: str(x[0])):
+            d = sorted(days[k])
+            print(f'   campaignTp={k[0]} prod={k[1]} activity={k[2]}: {round(v):,}원, {len(d)}일 ({d[0]}~{d[-1]})')
+        start = end + timedelta(days=1)
