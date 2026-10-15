@@ -12,12 +12,16 @@
 공통 지표
   광고비 · 노출수 · 클릭수 · 전환수 · 전환매출 → CTR · CPC · CPA · ROAS · 전환율
   메타: 링크클릭·구매·구매가치 / 구글: 클릭·전환·전환가치 / 네이버: 클릭·구매완료 전환·전환매출
-  광고비는 각 매체 API가 주는 값 그대로입니다(부가세 처리 기준이 매체마다 다를 수 있음).
+  금액은 원화(KRW)로 통일: 달러 등 외화 계정은 USD_KRW 환율(기본 1,350원)로 환산.
+  광고비는 VAT 별도 기준으로 통일: 네이버 총비용(VAT 포함)은 1.1로 나눔. 메타·구글은 원래 VAT 별도.
+  SPEND_VAT=포함 이면 반대로 메타·구글 광고비에 1.1을 곱해 VAT 포함 기준으로 맞춤. 전환매출은 그대로.
 
 환경변수
   GCP_SA_KEY, SHEET_ID : 매체 스크립트와 같은 시트
   SHEET_TAB / GOOGLE_SHEET_TAB / NAVER_RAW_PREFIX : 매체 스크립트와 같은 탭 이름 설정
   REPORT_TAB_PREFIX    : 통합 탭 이름 앞부분 (기본 통합)
+  USD_KRW              : 원화 환산 환율 (기본 1350)
+  SPEND_VAT            : 광고비 기준 별도|포함 (기본 별도)
 
 사용법
   python integrated_report.py                # 시트 RAW → 통합 탭 갱신
@@ -35,6 +39,7 @@ from pathlib import Path
 KST = timezone(timedelta(hours=9))
 MEDIA_ORDER = ["Meta", "Google", "Naver SA"]
 SUMS = ["광고비", "노출수", "클릭수", "전환수", "전환매출"]
+VAT = 1.1
 
 
 def env(name, default=None):
@@ -50,23 +55,48 @@ def num(v):
 
 
 # ───────────────────────── RAW → 공통 행 ─────────────────────────
+def to_krw(value, currency):
+    cur = str(currency or "KRW").upper()
+    if cur == "KRW":
+        return value
+    if cur == "USD":
+        return value * float(env("USD_KRW", "1350"))
+    raise ValueError(f"환율 미설정 통화: {cur} (USD·KRW만 지원)")
+
+
+def vat_included():
+    return env("SPEND_VAT", "별도") == "포함"
+
+
+def spend_from_net(value):
+    """메타·구글처럼 VAT 별도 금액 → 리포트 기준."""
+    return value * VAT if vat_included() else value
+
+
+def spend_from_gross(value):
+    """네이버처럼 VAT 포함 금액 → 리포트 기준."""
+    return value if vat_included() else value / VAT
+
+
 def from_meta(r):
     return {"날짜": str(r.get("날짜", "")), "매체": "Meta", "계정": r.get("계정명") or r.get("계정ID", ""),
-            "캠페인유형": "", "캠페인": r.get("캠페인명", ""), "광고비": num(r.get("광고비")),
+            "캠페인유형": "", "캠페인": r.get("캠페인명", ""),
+            "광고비": spend_from_net(to_krw(num(r.get("광고비")), r.get("통화"))),
             "노출수": num(r.get("노출수")), "클릭수": num(r.get("링크클릭수")),
-            "전환수": num(r.get("구매")), "전환매출": num(r.get("구매가치"))}
+            "전환수": num(r.get("구매")), "전환매출": to_krw(num(r.get("구매가치")), r.get("통화"))}
 
 
 def from_google(r):
     return {"날짜": str(r.get("날짜", "")), "매체": "Google", "계정": r.get("계정명") or r.get("계정ID", ""),
-            "캠페인유형": r.get("캠페인유형", ""), "캠페인": r.get("캠페인명", ""), "광고비": num(r.get("광고비")),
+            "캠페인유형": r.get("캠페인유형", ""), "캠페인": r.get("캠페인명", ""),
+            "광고비": spend_from_net(to_krw(num(r.get("광고비")), r.get("통화"))),
             "노출수": num(r.get("노출수")), "클릭수": num(r.get("클릭수")),
-            "전환수": num(r.get("전환수")), "전환매출": num(r.get("전환가치"))}
+            "전환수": num(r.get("전환수")), "전환매출": to_krw(num(r.get("전환가치")), r.get("통화"))}
 
 
 def from_naver(r):
     return {"날짜": str(r.get("일별", "")), "매체": "Naver SA", "계정": str(r.get("계정ID", "")),
-            "캠페인유형": r.get("캠페인 유형", ""), "캠페인": r.get("캠페인", ""), "광고비": num(r.get("총비용")),
+            "캠페인유형": r.get("캠페인 유형", ""), "캠페인": r.get("캠페인", ""), "광고비": spend_from_gross(num(r.get("총비용"))),
             "노출수": num(r.get("노출수")), "클릭수": num(r.get("클릭수")),
             "전환수": num(r.get("구매완료 전환수")), "전환매출": num(r.get("구매완료 전환매출액"))}
 
@@ -240,6 +270,7 @@ def main():
     sh = gspread.service_account_from_dict(json.loads(key)).open_by_key(sheet_id)
 
     rows, notes = read_sources(sh, gspread)
+    notes.append(f"기준: 원화, USD {env('USD_KRW', '1350')}원 환산, 광고비 VAT {'포함' if vat_included() else '별도'}")
     for n in notes:
         print(n)
     if not rows:
