@@ -102,11 +102,31 @@ def from_naver(r):
             "전환수": num(r.get("구매완료 전환수")), "전환매출": num(r.get("구매완료 전환매출액"))}
 
 
+def brk(base, r):
+    base.update({"차원": r.get("차원", ""), "값": r.get("값", "")})
+    return base
+
+
+def from_naver_media(r):
+    row = from_naver(r)
+    row.update({"차원": "기기", "값": r.get("PC/모바일 매체", "") or "기타"})
+    return row
+
+
 def sources():
     return [
         (env("SHEET_TAB", "meta_daily"), from_meta),
         (env("GOOGLE_SHEET_TAB", "google_daily"), from_google),
         (env("NAVER_RAW_PREFIX", "naver_raw") + "_campaign", from_naver),
+    ]
+
+
+def breakdown_sources():
+    """성별·연령·기기 (대시보드 분석용, 합계에는 넣지 않음). 네이버 검색광고는 기기만 제공."""
+    return [
+        (env("META_BREAKDOWN_TAB", "meta_breakdown"), lambda r: brk(from_meta(r), r)),
+        (env("GOOGLE_BREAKDOWN_TAB", "google_breakdown"), lambda r: brk(from_google(r), r)),
+        (env("NAVER_RAW_PREFIX", "naver_raw") + "_media", from_naver_media),
     ]
 
 
@@ -204,9 +224,9 @@ def build(rows):
 
 
 # ───────────────────────── 시트 입출력 ─────────────────────────
-def read_sources(sh, gspread):
+def read_sources(sh, gspread, specs=None):
     rows, notes = [], []
-    for tab, fn in sources():
+    for tab, fn in specs or sources():
         try:
             values = sh.worksheet(tab).get_values(value_render_option="UNFORMATTED_VALUE")
         except gspread.WorksheetNotFound:
@@ -271,6 +291,8 @@ def main():
     sh = gspread.service_account_from_dict(json.loads(key)).open_by_key(sheet_id)
 
     rows, notes = read_sources(sh, gspread)
+    breakdown, brk_notes = read_sources(sh, gspread, breakdown_sources())
+    notes += brk_notes
     notes.append(f"기준: 원화, USD {env('USD_KRW', '1350')}원 환산, 광고비 VAT {'포함' if vat_included() else '별도'}")
     for n in notes:
         print(n)
@@ -288,11 +310,11 @@ def main():
         print(f"{prefix}_{name}: {len(data)}행{' (dry-run, 시트 미변경)' if args.dry_run else ''}")
     import dashboard
     basis = f"비용 VAT {'포함' if vat_included() else '별도'} · 원화(USD {env('USD_KRW', '1350')}원)"
-    board, chart = dashboard.build(rows, basis, datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
+    board = dashboard.build(rows, breakdown, basis, datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
     with open(outdir / "대시보드.csv", "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerows(board.grid())
     if not args.dry_run:
-        dashboard.write(sh, gspread, f"{prefix}_대시보드", board, chart)
+        dashboard.write(sh, gspread, f"{prefix}_대시보드", board)
     print(f"{prefix}_대시보드: 갱신{' (dry-run, 시트 미변경)' if args.dry_run else ''}")
     step_summary(tabs, notes)
     return 0

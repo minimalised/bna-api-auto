@@ -11,6 +11,7 @@ Google Ads 캠페인 성과 → 구글 시트 적재 (최근 N일 upsert) + CSV 
   GOOGLE_ADS_CUSTOMER_IDS        : 조회할 광고계정 ID, 쉼표 구분 (하이픈 있어도 됨)
   GCP_SA_KEY, SHEET_ID           : 메타와 동일한 시트 사용
   GOOGLE_SHEET_TAB               : 기본 google_daily
+  GOOGLE_BREAKDOWN_TAB           : 성별·연령·기기 탭, 기본 google_breakdown
 
 사용법
   python google_report.py                     # 최근 30일(어제까지) 재조회 → 시트 덮어쓰기
@@ -44,6 +45,36 @@ FROM campaign
 WHERE segments.date BETWEEN '{since}' AND '{until}'
   AND metrics.impressions > 0
 """
+
+# 성별·연령·기기 (대시보드 분석용). 실적 최대화 캠페인은 성별·연령을 제공하지 않음
+BREAKDOWN_SELECT = """
+SELECT
+  customer.id, customer.descriptive_name, customer.currency_code,
+  campaign.id, campaign.name, segments.date, {field},
+  metrics.impressions, metrics.clicks, metrics.cost_micros,
+  metrics.conversions, metrics.conversions_value
+FROM {resource}
+WHERE segments.date BETWEEN '{since}' AND '{until}'
+  AND metrics.impressions > 0
+"""
+GENDER = {"MALE": "남성", "FEMALE": "여성"}
+DEVICE = {"MOBILE": "모바일", "DESKTOP": "PC", "TABLET": "태블릿", "CONNECTED_TV": "TV"}
+
+
+def age_label(name):
+    parts = name.replace("AGE_RANGE_", "").split("_")
+    if parts == ["65", "UP"]:
+        return "65+"
+    return "-".join(parts) if parts[0].isdigit() else "알수없음"
+
+
+BREAKDOWNS = [
+    ("성별", "gender_view", "ad_group_criterion.gender.type",
+     lambda r: GENDER.get(r.ad_group_criterion.gender.type_.name, "알수없음")),
+    ("연령", "age_range_view", "ad_group_criterion.age_range.type",
+     lambda r: age_label(r.ad_group_criterion.age_range.type_.name)),
+    ("기기", "campaign", "segments.device", lambda r: DEVICE.get(r.segments.device.name, "기타")),
+]
 
 ACCOUNTS_QUERY = """
 SELECT customer_client.id, customer_client.descriptive_name,
@@ -128,6 +159,32 @@ def fetch(client, customer_id, since, until):
     return rows
 
 
+def fetch_breakdowns(client, customer_id, since, until):
+    svc = client.get_service("GoogleAdsService")
+    agg = {}
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    for dim, resource, field, label in BREAKDOWNS:
+        query = BREAKDOWN_SELECT.format(field=field, resource=resource, since=since, until=until)
+        for batch in svc.search_stream(customer_id=customer_id, query=query):
+            for r in batch.results:
+                key = (r.segments.date, str(r.customer.id), str(r.campaign.id), dim, label(r))
+                row = agg.setdefault(key, {
+                    "날짜": key[0], "계정ID": key[1], "계정명": r.customer.descriptive_name,
+                    "캠페인ID": key[2], "캠페인명": r.campaign.name, "통화": r.customer.currency_code,
+                    "차원": dim, "값": key[4], "노출수": 0, "클릭수": 0, "광고비": 0.0,
+                    "전환수": 0.0, "전환가치": 0.0, "수집시각": now})
+                row["노출수"] += r.metrics.impressions
+                row["클릭수"] += r.metrics.clicks
+                row["광고비"] += r.metrics.cost_micros / 1_000_000
+                row["전환수"] += r.metrics.conversions
+                row["전환가치"] += r.metrics.conversions_value
+    for row in agg.values():
+        row["광고비"] = money(row["광고비"], row["통화"])
+        row["전환가치"] = money(row["전환가치"], row["통화"])
+        row["전환수"] = round(row["전환수"], 2)
+    return list(agg.values())
+
+
 def num(v):
     try:
         return float(v)
@@ -135,12 +192,12 @@ def num(v):
         return 0.0
 
 
-def upsert_sheet(new_rows, since, until, done_ids):
+def upsert_sheet(new_rows, since, until, done_ids, tab=None):
     import gspread
 
     gc = gspread.service_account_from_dict(json.loads(get_env("GCP_SA_KEY")))
     sh = gc.open_by_key(get_env("SHEET_ID"))
-    tab = os.getenv("GOOGLE_SHEET_TAB", "google_daily").strip() or "google_daily"
+    tab = tab or os.getenv("GOOGLE_SHEET_TAB", "google_daily").strip() or "google_daily"
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -239,6 +296,28 @@ def main():
 
     if get_env("SHEET_ID", required=False) and done:
         upsert_sheet(rows, since, until, done)
+
+    # 성별·연령·기기: 실패해도 기본 데이터는 그대로 두고 경고만 남김
+    brk_rows, brk_done = [], set()
+    for cid in done:
+        try:
+            got = fetch_breakdowns(client, cid, since, until)
+            brk_rows += got
+            brk_done.add(cid)
+            print(f"  ✓ {cid} 성별·연령·기기: {len(got)}행")
+        except GoogleAdsException as ex:
+            print(f"::warning::{cid} 성별·연령·기기 수집 실패: {explain(ex)}")
+        except Exception as ex:
+            print(f"::warning::{cid} 성별·연령·기기 수집 실패: {ex}")
+    if brk_rows:
+        Path("reports").mkdir(exist_ok=True)
+        with open(Path("reports") / f"google_breakdown_{since}_{until}.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=brk_rows[0].keys())
+            w.writeheader()
+            w.writerows(brk_rows)
+    if get_env("SHEET_ID", required=False) and brk_done:
+        upsert_sheet(brk_rows, since, until, brk_done,
+                     os.getenv("GOOGLE_BREAKDOWN_TAB", "").strip() or "google_breakdown")
 
     if failed:
         sys.exit(f"실패 계정: {', '.join(failed)}")
