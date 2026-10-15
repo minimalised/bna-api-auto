@@ -465,7 +465,14 @@ class SheetWriter:
             ws = self.sh.worksheet(tab)
             values = ws.get_values(value_render_option='UNFORMATTED_VALUE')
             if values and values[0] != h:
-                raise ValueError(f'{tab}: 기존 헤더가 다릅니다. 새 NAVER_RAW_PREFIX로 먼저 실행하세요.')
+                if not any(any(v) for v in values[1:]):
+                    values = []  # 헤더만 있고 데이터가 없으면 코드 기준 헤더로 다시 씀
+                else:
+                    cur = [str(c) for c in values[0]]
+                    raise ValueError(f'{tab}: 기존 헤더가 다릅니다 (데이터 {len(values) - 1}행). '
+                                     f'시트에만 있음 {[c for c in cur if c not in h]} / '
+                                     f'코드에만 있음 {[c for c in h if c not in cur]} / '
+                                     f'시트 앞 5열 {cur[:5]}')
             old = [dict(zip(h, v + [''] * (len(h) - len(v)))) for v in values[1:] if any(v)] if values else []
         except self.gspread.WorksheetNotFound:
             ws, old = None, []
