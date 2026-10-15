@@ -8,6 +8,7 @@
   통합_일별 : 날짜 × 매체 × 캠페인
   통합_주간 : 주(월~일) × 매체, 매체 합계, 전주 대비
   통합_월간 : 월 × 매체, 매체 합계, 전월 대비
+  통합_대시보드 : 핵심 지표·매체별 이번 달 성과와 월말 예상·최근 30일 추이 (dashboard.py)
 
 공통 지표
   광고비 · 노출수 · 클릭수 · 전환수 · 전환매출 → CTR · CPC · CPA · ROAS · 전환율
@@ -285,6 +286,14 @@ def main():
         if not args.dry_run:
             write_tab(sh, gspread, f"{prefix}_{name}", cols, data)
         print(f"{prefix}_{name}: {len(data)}행{' (dry-run, 시트 미변경)' if args.dry_run else ''}")
+    import dashboard
+    basis = f"비용 VAT {'포함' if vat_included() else '별도'} · 원화(USD {env('USD_KRW', '1350')}원)"
+    board, chart = dashboard.build(rows, basis, datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
+    with open(outdir / "대시보드.csv", "w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerows(board.grid())
+    if not args.dry_run:
+        dashboard.write(sh, gspread, f"{prefix}_대시보드", board, chart)
+    print(f"{prefix}_대시보드: 갱신{' (dry-run, 시트 미변경)' if args.dry_run else ''}")
     step_summary(tabs, notes)
     return 0
 
