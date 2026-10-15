@@ -496,6 +496,76 @@ class SheetWriter:
         print(f'{tab}: {len(merged)}행 적재', flush=True)
 
 
+BRAND_TAB_COLS = ['계정ID', '결제일', '결제금액(VAT포함)', '계약 시작일', '계약 종료일', '캠페인', '메모', '수집시각']
+
+
+def loose_day(value):
+    """시트에 사람이 적은 날짜(2026-09-21, 2026. 9. 21, 2026/9/21, 날짜 일련번호) → ISO. 못 읽으면 ''."""
+    s = str(value or '').strip().rstrip('.')
+    if not s:
+        return ''
+    try:
+        if s.replace('.', '', 1).isdigit() and float(s) > 20000:
+            return (date(1899, 12, 30) + timedelta(days=int(float(s)))).isoformat()
+        parts = [p for p in s.replace('/', '-').replace('.', '-').replace(' ', '').split('-') if p]
+        return date(*map(int, parts[:3])).isoformat()
+    except (ValueError, TypeError):
+        return ''
+
+
+def brand_charges(client, customer, today, lookback=120):
+    """브랜드검색 계약 결제액: 비즈머니 소진 내역 중 campaignTp=4(브랜드검색). 계약 기간은 API가 주지 않음."""
+    out = {}
+    start = max(today - timedelta(days=lookback), date(2026, 3, 30))
+    while start < today:
+        end = min(start + timedelta(days=30), today - timedelta(days=1))
+        rows = client.get('/billing/bizmoney/histories/exhaust', customer,
+                          {'searchStartDt': start.strftime('%Y%m%d'), 'searchEndDt': end.strftime('%Y%m%d')})
+        for r in rows or []:
+            if r.get('campaignTp') != 4:
+                continue
+            day = datetime.fromtimestamp(r['settleDt'] / 1000, KST).date().isoformat()
+            amt = -(float(r.get('useRefundableAmt') or 0) + float(r.get('useNonrefundableAmt') or 0))
+            out[day] = out.get(day, 0) + amt
+        start = end + timedelta(days=1)
+    return {d: round(a) for d, a in out.items() if round(a)}
+
+
+def write_brand_tab(sh, gspread, fetched, fetched_customers):
+    """결제 행은 API 값으로 갱신하고, 사람이 적은 계약 기간·캠페인·메모는 그대로 둔다."""
+    tab = env('BRAND_SEARCH_TAB', '브랜드검색_결제')
+    try:
+        ws = sh.worksheet(tab)
+        values = ws.get_values(value_render_option='FORMATTED_VALUE')
+    except gspread.WorksheetNotFound:
+        ws, values = None, []
+    head = [str(c) for c in values[0]] if values else BRAND_TAB_COLS
+    old = {}
+    for v in values[1:]:
+        r = dict(zip(head, [str(x) for x in v]))
+        for c in ('결제일', '계약 시작일', '계약 종료일'):
+            r[c] = loose_day(r.get(c)) or r.get(c, '')
+        if r.get('계정ID') and r.get('결제일'):
+            old[(r['계정ID'], r['결제일'])] = r
+    now = datetime.now(KST).strftime('%Y-%m-%d %H:%M')
+    for key, amt in fetched.items():
+        r = old.get(key, {})
+        r.update({'계정ID': key[0], '결제일': key[1], '결제금액(VAT포함)': amt, '수집시각': now})
+        old[key] = r
+    # 조회 기간 안인데 API에 없는 결제(환불 등)는 지움. 사람이 기간을 적어 둔 행도 결제가 없으면 의미가 없음.
+    for key in [k for k in old if k[0] in fetched_customers and k[1] >= fetched_customers[k[0]] and k not in fetched]:
+        del old[key]
+    rows = sorted(old.values(), key=lambda r: (r['결제일'], r['계정ID']), reverse=True)
+    grid = [BRAND_TAB_COLS] + [[r.get(c, '') for c in BRAND_TAB_COLS] for r in rows]
+    if ws is None:
+        ws = sh.add_worksheet(title=tab, rows=max(len(grid), 20), cols=len(BRAND_TAB_COLS))
+    ws.clear()
+    ws.resize(rows=max(len(grid), 20), cols=len(BRAND_TAB_COLS))
+    ws.update(range_name='A1', values=grid, value_input_option='RAW')
+    ws.freeze(rows=1)
+    print(f'{tab}: 결제 {len(rows)}건', flush=True)
+
+
 def colname(n):
     result = ''
     while n:
@@ -608,6 +678,19 @@ def main():
                         errors.append(f'{report}: 시트 쓰기 실패 ({type(e).__name__}: {str(e)[:300]})')
         except Exception as e:
             errors.append(f'시트 연결 실패 ({type(e).__name__}: {str(e)[:300]})')
+    if not args.dry_run and 'campaign' in selected:
+        try:
+            fetched, windows = {}, {}
+            for customer in customers:
+                for day, amt in brand_charges(client, customer, today).items():
+                    fetched[(customer, day)] = amt
+                windows[customer] = max(today - timedelta(days=120), date(2026, 3, 30)).isoformat()
+            write_csv(outdir / 'brand_charges.csv', ['계정ID', '결제일', '결제금액(VAT포함)'],
+                      [{'계정ID': c, '결제일': d, '결제금액(VAT포함)': a} for (c, d), a in fetched.items()])
+            writer = SheetWriter()
+            write_brand_tab(writer.sh, writer.gspread, fetched, windows)
+        except Exception as e:
+            errors.append(f'브랜드검색 결제 내역 실패 ({type(e).__name__}: {str(e)[:300]})')
     summary = ['### 네이버 RAW 5종 수집', f'기간: {since} ~ {until}',
                '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만.',
                '파워링크 검색어 전환수/매출/평균순위는 미제공(빈칸).',

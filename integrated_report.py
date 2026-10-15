@@ -10,6 +10,9 @@
   통합_월간 : 월 × 매체, 매체 합계, 전월 대비
   통합_대시보드 : 핵심 지표·매체별 이번 달 성과와 월말 예상·최근 30일 추이 (dashboard.py)
 
+브랜드검색은 계약 선결제라 API 비용이 0원입니다. 네이버 리포트가 비즈머니 소진 내역에서 '브랜드검색_결제' 탭에
+결제액을 적어 두면, 계약 시작일·종료일(비우면 결제일부터 30일)에 하루 같은 금액으로 나눠 네이버 비용에 넣습니다.
+
 공통 지표
   광고비 · 노출수 · 클릭수 · 전환수 · 전환매출 → CTR · CPC · CPA · ROAS · 전환율
   메타: 링크클릭·구매·구매가치 / 구글: 클릭·전환·전환가치 / 네이버: 클릭·구매완료 전환·전환매출
@@ -111,6 +114,58 @@ def from_naver_media(r):
     row = from_naver(r)
     row.update({"차원": "기기", "값": r.get("PC/모바일 매체", "") or "기타"})
     return row
+
+
+def loose_day(value):
+    """시트에 사람이 적은 날짜(2026-09-21, 2026. 9. 21, 2026/9/21, 날짜 일련번호) → ISO. 못 읽으면 ''."""
+    s = str(value or "").strip().rstrip(".")
+    if not s:
+        return ""
+    try:
+        if s.replace(".", "", 1).isdigit() and float(s) > 20000:
+            return (date(1899, 12, 30) + timedelta(days=int(float(s)))).isoformat()
+        parts = [p for p in s.replace("/", "-").replace(".", "-").replace(" ", "").split("-") if p]
+        return date(*map(int, parts[:3])).isoformat()
+    except (ValueError, TypeError):
+        return ""
+
+
+def brand_search_rows(charges, rows):
+    """브랜드검색 계약 결제액을 계약 기간에 하루 같은 금액으로 나눠 네이버 검색광고 비용으로 넣는다.
+    기간을 적지 않은 결제는 결제일부터 BRAND_SEARCH_DAYS일(기본 30). 리포트 데이터 기간(첫날~마지막 날) 밖의 몫은 넣지 않음."""
+    if not charges or not rows:
+        return [], []
+    first, last = min(r["날짜"] for r in rows), max(r["날짜"] for r in rows)
+    default_days = int(env("BRAND_SEARCH_DAYS", "30"))
+    # 비용을 붙일 캠페인: 그 계정·날짜에 노출된 브랜드검색 캠페인이 하나면 그 캠페인, 아니면 '브랜드검색'
+    shown = defaultdict(set)
+    for r in rows:
+        if r["매체"] == "Naver SA" and r["캠페인유형"] == "브랜드검색" and r["노출수"] > 0:
+            shown[(r["계정"], r["날짜"])].add(r["캠페인"])
+    out, notes = [], []
+    for c in charges:
+        paid, amount = loose_day(c.get("결제일")), num(c.get("결제금액(VAT포함)"))
+        if not paid or not amount:
+            continue
+        start = loose_day(c.get("계약 시작일")) or paid
+        end = loose_day(c.get("계약 종료일")) or (date.fromisoformat(start) + timedelta(days=default_days - 1)).isoformat()
+        if end < start:
+            notes.append(f"브랜드검색 {paid} 결제: 종료일이 시작일보다 빨라 건너뜀")
+            continue
+        n = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+        account = str(c.get("계정ID", ""))
+        for i in range(n):
+            d = (date.fromisoformat(start) + timedelta(days=i)).isoformat()
+            if d > last:
+                break
+            if d < first:
+                continue
+            names = shown.get((account, d), set())
+            camp = str(c.get("캠페인") or "") or (next(iter(names)) if len(names) == 1 else "브랜드검색")
+            out.append({"날짜": d, "매체": "Naver SA", "계정": account, "캠페인유형": "브랜드검색", "캠페인": camp,
+                        "광고비": spend_from_gross(amount / n), "노출수": 0.0, "클릭수": 0.0, "전환수": 0.0, "전환매출": 0.0})
+        notes.append(f"브랜드검색 {paid} 결제 {amount:,.0f}원: {start}~{end} ({n}일) 배분")
+    return out, notes
 
 
 def sources():
@@ -291,6 +346,14 @@ def main():
     sh = gspread.service_account_from_dict(json.loads(key)).open_by_key(sheet_id)
 
     rows, notes = read_sources(sh, gspread)
+    try:
+        charges = sh.worksheet(env("BRAND_SEARCH_TAB", "브랜드검색_결제")).get_all_records(
+            value_render_option="UNFORMATTED_VALUE")
+    except gspread.WorksheetNotFound:
+        charges = []
+    brand, brand_notes = brand_search_rows(charges, rows)
+    rows += brand
+    notes += brand_notes
     breakdown, brk_notes = read_sources(sh, gspread, breakdown_sources())
     notes += brk_notes
     notes.append(f"기준: 원화, USD {env('USD_KRW', '1350')}원 환산, 광고비 VAT {'포함' if vat_included() else '별도'}")
