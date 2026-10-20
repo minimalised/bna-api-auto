@@ -1,0 +1,94 @@
+name: Naver AdGroup Settings
+
+# 수동 실행 전용. list는 읽기 전용, update/delete-ads는 apply를 켜야만 실제 반영.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "list=현황 조회, update=그룹 설정 변경, delete-ads=소재 삭제(복구 불가)"
+        type: choice
+        options: [list, update, delete-ads]
+        default: list
+      adgroup_ids:
+        description: "update: 광고그룹ID (쉼표 구분)"
+        type: string
+        required: false
+      name:
+        description: "update: 새 광고그룹 이름 (그룹 1개일 때만)"
+        type: string
+        required: false
+      media_target:
+        description: "update: 매체 타게팅 JSON (list 결과 형식)"
+        type: string
+        required: false
+      time_weekly_target:
+        description: "update: 요일·시간대 타게팅 JSON (list 결과 형식)"
+        type: string
+        required: false
+      ad_ids:
+        description: "delete-ads: 소재ID (쉼표 구분)"
+        type: string
+        required: false
+      apply:
+        description: "실제 반영 (끄면 변경 전→후 미리보기만)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: naver-adgroup
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run
+        env:
+          NAVER_API_KEY: ${{ secrets.NAVER_API_KEY }}
+          NAVER_SECRET_KEY: ${{ secrets.NAVER_SECRET_KEY }}
+          NAVER_CUSTOMER_ID: ${{ secrets.NAVER_CUSTOMER_ID }}
+          NAVER_CUSTOMER_IDS: ${{ secrets.NAVER_CUSTOMER_IDS }}
+          IN_ACTION: ${{ inputs.action }}
+          IN_IDS: ${{ inputs.adgroup_ids }}
+          IN_NAME: ${{ inputs.name }}
+          IN_MEDIA: ${{ inputs.media_target }}
+          IN_TIME: ${{ inputs.time_weekly_target }}
+          IN_AD_IDS: ${{ inputs.ad_ids }}
+          IN_APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          ARGS=("$IN_ACTION")
+          if [[ "$IN_ACTION" == "update" ]]; then
+            ARGS+=(--ids "$IN_IDS")
+            [[ -n "$IN_NAME" ]] && ARGS+=(--name "$IN_NAME")
+            [[ -n "$IN_MEDIA" ]] && ARGS+=(--target "MEDIA_TARGET=$IN_MEDIA")
+            [[ -n "$IN_TIME" ]] && ARGS+=(--target "TIME_WEEKLY_TARGET=$IN_TIME")
+          elif [[ "$IN_ACTION" == "delete-ads" ]]; then
+            ARGS+=(--ad-ids "$IN_AD_IDS")
+          fi
+          if [[ "$IN_ACTION" != "list" && "$IN_APPLY" == "true" ]]; then
+            ARGS+=(--apply)
+          fi
+          python naver_adgroup.py "${ARGS[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: naver-adgroup-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
