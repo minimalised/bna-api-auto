@@ -12,6 +12,7 @@ Google Ads 캠페인 성과 → 구글 시트 적재 (최근 N일 upsert) + CSV 
   GCP_SA_KEY, SHEET_ID           : 메타와 동일한 시트 사용
   GOOGLE_SHEET_TAB               : 기본 google_daily
   GOOGLE_BREAKDOWN_TAB           : 성별·연령·기기 탭, 기본 google_breakdown
+  GOOGLE_SEARCH_TERM_TAB         : 검색광고 검색어 탭, 기본 google_search_terms
 
 사용법
   python google_report.py                     # 최근 30일(어제까지) 재조회 → 시트 덮어쓰기
@@ -75,6 +76,19 @@ BREAKDOWNS = [
      lambda r: age_label(r.ad_group_criterion.age_range.type_.name)),
     ("기기", "campaign", "segments.device", lambda r: DEVICE.get(r.segments.device.name, "기타")),
 ]
+
+# 검색광고 캠페인의 실제 검색어 (대시보드 검색어 효율용). 실적 최대화 검색어는 제외
+SEARCH_TERM_QUERY = """
+SELECT
+  customer.id, customer.descriptive_name, customer.currency_code,
+  campaign.id, campaign.name, segments.date, search_term_view.search_term,
+  metrics.impressions, metrics.clicks, metrics.cost_micros,
+  metrics.conversions, metrics.conversions_value
+FROM search_term_view
+WHERE segments.date BETWEEN '{since}' AND '{until}'
+  AND campaign.advertising_channel_type = 'SEARCH'
+  AND metrics.impressions > 0
+"""
 
 ACCOUNTS_QUERY = """
 SELECT customer_client.id, customer_client.descriptive_name,
@@ -178,6 +192,31 @@ def fetch_breakdowns(client, customer_id, since, until):
                 row["광고비"] += r.metrics.cost_micros / 1_000_000
                 row["전환수"] += r.metrics.conversions
                 row["전환가치"] += r.metrics.conversions_value
+    for row in agg.values():
+        row["광고비"] = money(row["광고비"], row["통화"])
+        row["전환가치"] = money(row["전환가치"], row["통화"])
+        row["전환수"] = round(row["전환수"], 2)
+    return list(agg.values())
+
+
+def fetch_search_terms(client, customer_id, since, until):
+    """같은 검색어가 광고그룹마다 따로 오므로 날짜·캠페인·검색어로 합침."""
+    svc = client.get_service("GoogleAdsService")
+    agg = {}
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    for batch in svc.search_stream(customer_id=customer_id, query=SEARCH_TERM_QUERY.format(since=since, until=until)):
+        for r in batch.results:
+            key = (r.segments.date, str(r.customer.id), str(r.campaign.id), r.search_term_view.search_term)
+            row = agg.setdefault(key, {
+                "날짜": key[0], "계정ID": key[1], "계정명": r.customer.descriptive_name,
+                "캠페인ID": key[2], "캠페인명": r.campaign.name, "통화": r.customer.currency_code,
+                "검색어": key[3], "노출수": 0, "클릭수": 0, "광고비": 0.0,
+                "전환수": 0.0, "전환가치": 0.0, "수집시각": now})
+            row["노출수"] += r.metrics.impressions
+            row["클릭수"] += r.metrics.clicks
+            row["광고비"] += r.metrics.cost_micros / 1_000_000
+            row["전환수"] += r.metrics.conversions
+            row["전환가치"] += r.metrics.conversions_value
     for row in agg.values():
         row["광고비"] = money(row["광고비"], row["통화"])
         row["전환가치"] = money(row["전환가치"], row["통화"])
@@ -318,6 +357,28 @@ def main():
     if get_env("SHEET_ID", required=False) and brk_done:
         upsert_sheet(brk_rows, since, until, brk_done,
                      os.getenv("GOOGLE_BREAKDOWN_TAB", "").strip() or "google_breakdown")
+
+    # 검색어: 실패해도 기본 데이터는 그대로 두고 경고만 남김
+    term_rows, term_done = [], set()
+    for cid in done:
+        try:
+            got = fetch_search_terms(client, cid, since, until)
+            term_rows += got
+            term_done.add(cid)
+            print(f"  ✓ {cid} 검색어: {len(got)}행")
+        except GoogleAdsException as ex:
+            print(f"::warning::{cid} 검색어 수집 실패: {explain(ex)}")
+        except Exception as ex:
+            print(f"::warning::{cid} 검색어 수집 실패: {ex}")
+    if term_rows:
+        Path("reports").mkdir(exist_ok=True)
+        with open(Path("reports") / f"google_search_terms_{since}_{until}.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=term_rows[0].keys())
+            w.writeheader()
+            w.writerows(term_rows)
+    if get_env("SHEET_ID", required=False) and term_done:
+        upsert_sheet(term_rows, since, until, term_done,
+                     os.getenv("GOOGLE_SEARCH_TERM_TAB", "").strip() or "google_search_terms")
 
     if failed:
         sys.exit(f"실패 계정: {', '.join(failed)}")

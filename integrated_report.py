@@ -8,7 +8,7 @@
   통합_일별 : 날짜 × 매체 × 캠페인
   통합_주간 : 주(월~일) × 매체, 매체 합계, 전주 대비
   통합_월간 : 월 × 매체, 매체 합계, 전월 대비
-  통합_대시보드 : 핵심 지표·매체별 이번 달 성과와 월말 예상·최근 30일 추이 (dashboard.py)
+  통합_대시보드 : 핵심 지표·매체별 이번 달 성과와 월말 예상·최근 30일 추이·검색어 효율 (dashboard.py)
 
 브랜드검색은 계약 선결제라 API 비용이 0원입니다. 네이버 리포트가 비즈머니 소진 내역에서 '브랜드검색_결제' 탭에
 결제액을 적어 두면, 계약 시작일·종료일(비우면 결제일부터 30일)에 하루 같은 금액으로 나눠 네이버 비용에 넣습니다.
@@ -185,6 +185,23 @@ def breakdown_sources():
     ]
 
 
+def term(base, product, text):
+    base.update({"상품": product, "검색어": str(text)})
+    return base
+
+
+def search_term_sources():
+    """검색어 효율 (대시보드 분석용, 합계에는 넣지 않음). 파워링크는 검색어별 전환을 API가 주지 않아 등록 키워드 기준."""
+    naver = env("NAVER_RAW_PREFIX", "naver_raw")
+    return [
+        (naver + "_keyword", lambda r: term(from_naver(r), "파워링크", r.get("키워드", ""))),
+        (naver + "_search", lambda r: term(from_naver(r), "쇼핑검색", r.get("검색어", ""))
+            if r.get("캠페인 유형") == "쇼핑검색" else None),
+        (env("GOOGLE_SEARCH_TERM_TAB", "google_search_terms"),
+         lambda r: term(from_google(r), "구글 검색광고", r.get("검색어", ""))),
+    ]
+
+
 def ratios(r):
     s, imp, clk, conv, rev = (r[k] for k in SUMS)
     r["CTR(%)"] = round(clk / imp * 100, 2) if imp else ""
@@ -292,7 +309,7 @@ def read_sources(sh, gspread, specs=None):
             continue
         header = values[0]
         got = [fn(dict(zip(header, v))) for v in values[1:] if any(v)]
-        got = [r for r in got if len(r["날짜"]) == 10]
+        got = [r for r in got if r and len(r["날짜"]) == 10]
         rows += got
         notes.append(f"{tab}: {len(got)}행")
     return rows, notes
@@ -356,6 +373,8 @@ def main():
     notes += brand_notes
     breakdown, brk_notes = read_sources(sh, gspread, breakdown_sources())
     notes += brk_notes
+    terms, term_notes = read_sources(sh, gspread, search_term_sources())
+    notes += term_notes
     notes.append(f"기준: 원화, USD {env('USD_KRW', '1350')}원 환산, 광고비 VAT {'포함' if vat_included() else '별도'}")
     for n in notes:
         print(n)
@@ -373,7 +392,7 @@ def main():
         print(f"{prefix}_{name}: {len(data)}행{' (dry-run, 시트 미변경)' if args.dry_run else ''}")
     import dashboard
     basis = f"비용 VAT {'포함' if vat_included() else '별도'} · 원화(USD {env('USD_KRW', '1350')}원)"
-    board = dashboard.build(rows, breakdown, basis, datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
+    board = dashboard.build(rows, breakdown, basis, datetime.now(KST).strftime("%Y-%m-%d %H:%M"), terms)
     with open(outdir / "대시보드.csv", "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerows(board.grid())
     if not args.dry_run:

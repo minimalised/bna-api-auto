@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Naver Search Ads → 5 RAW tabs. See README.md for API coverage limits.
+"""Naver Search Ads → 6 RAW tabs. See README.md for API coverage limits.
 No credentials at import time. Python 3.10+, gspread 6.x for sheet writes.
 """
 import argparse
@@ -27,10 +27,11 @@ KST = timezone(timedelta(hours=9))
 class Unsupported(ValueError):
     """API가 해당 세부 구분을 내려주지 않음: 실패가 아니라 미제공으로 기록."""
 BASE_URL = 'https://api.searchad.naver.com'
-REPORTS = ('campaign', 'search', 'media', 'gender', 'age')
+REPORTS = ('campaign', 'search', 'keyword', 'media', 'gender', 'age')
 DIMS = {
     'campaign': ['일별', '캠페인 유형', '캠페인'],
     'search': ['일별', '캠페인 유형', '캠페인', '광고그룹', '검색어'],
+    'keyword': ['일별', '캠페인 유형', '캠페인', '광고그룹', '키워드'],
     'media': ['일별', '캠페인 유형', '캠페인', '광고그룹', 'PC/모바일 매체', '검색/콘텐츠 매체'],
     'gender': ['일별', '캠페인 유형', '캠페인', '광고그룹', '성별'],
     'age': ['일별', '캠페인 유형', '캠페인', '광고그룹', '연령대'],
@@ -232,6 +233,7 @@ class Collector:
         self.media = None
         self.cache = {}
         self.group_errors = {}
+        self.keywords, self.keyword_groups = {}, set()
         camps = client.get('/ncc/campaigns', customer)
         if not isinstance(camps, list):
             raise ValueError('캠페인 목록 형식 오류')
@@ -393,6 +395,32 @@ class Collector:
         for r in shop:
             r['비고'] = (r['비고'] + '; 검색어가 있는 검색 지면만 집계').strip('; ')
         return power + shop
+
+    def keyword(self, day):
+        # 파워링크 검색어는 전환을 주지 않으므로, 전환이 잡히는 등록 키워드 단위로 따로 집계
+        power = {cid for cid, c in self.campaigns.items() if c.get('campaignTp') == 'WEB_SITE'}
+        if power.intersection(self.group_errors):
+            raise ValueError('파워링크 광고그룹 목록 조회 실패: 기존 데이터 보존')
+        self.load_keywords(power)
+        pick = lambda rows: [r for r in rows if r['campaign'] in power]
+        name = lambda k: '(키워드 없음)' if k in ('', '-') else self.keywords.get(k, k)
+        key = lambda r: (r['campaign'], r['group'], name(r['keyword']))
+        rows = self.aggregate(day, pick(self.bulk('AD', day)), pick(self.bulk('AD_CONVERSION', day)), key, ['키워드'],
+                              'AD+AD_CONVERSION', purchase=True, rank=True)
+        for r in rows:
+            r['비고'] = (r['비고'] + '; 파워링크 등록 키워드 기준').strip('; ')
+        return rows
+
+    def load_keywords(self, campaigns):
+        for gid, g in self.groups.items():
+            if g.get('nccCampaignId') not in campaigns or gid in self.keyword_groups:
+                continue
+            part = self.client.get('/ncc/keywords', self.customer, {'nccAdgroupId': gid})
+            if not isinstance(part, list):
+                raise ValueError('키워드 목록 형식 오류')
+            for k in part:
+                self.keywords[k['nccKeywordId']] = k.get('keyword') or k['nccKeywordId']
+            self.keyword_groups.add(gid)
 
     def aggregate(self, day, perf, conv, keyfn, labels, source, purchase, rank):
         totals = {}
@@ -603,7 +631,7 @@ def main():
         p.error('이 버전은 VAT 기준 통일을 위해 2026-03-30 이후만 지원합니다.')
     selected = list(dict.fromkeys(x.strip() for x in args.reports.split(',') if x.strip()))
     if not selected or set(selected) - set(REPORTS):
-        p.error('--reports: campaign,search,media,gender,age 중 선택')
+        p.error('--reports: ' + ','.join(REPORTS) + ' 중 선택')
     owner = env('NAVER_CUSTOMER_ID')
     customers = list(dict.fromkeys(c.strip() for c in env('NAVER_CUSTOMER_IDS', owner).split(',') if c.strip()))
     client = Client()
@@ -620,7 +648,7 @@ def main():
     status = []
     errors = []
     cutoff = (today - timedelta(days=7)).isoformat()
-    print('범위: 성별/연령=쇼핑검색 최근 7일; 검색어=파워링크+쇼핑검색. 미제공 지표는 빈칸.', flush=True)
+    print('범위: 성별/연령=쇼핑검색 최근 7일; 검색어=파워링크+쇼핑검색; 키워드=파워링크. 미제공 지표는 빈칸.', flush=True)
     for customer in customers:
         try:
             collector = Collector(client, customer)
@@ -637,7 +665,7 @@ def main():
                     continue
                 try:
                     method = {'campaign': collector.campaign, 'search': collector.search,
-                              'media': collector.media_report}.get(report)
+                              'keyword': collector.keyword, 'media': collector.media_report}.get(report)
                     rows = method(day) if method else collector.demographic(day, report)
                     # Validate keys before treating a day as replaceable.
                     merge_rows([], rows, set(), report)
@@ -691,8 +719,8 @@ def main():
             write_brand_tab(writer.sh, writer.gspread, fetched, windows)
         except Exception as e:
             errors.append(f'브랜드검색 결제 내역 실패 ({type(e).__name__}: {str(e)[:300]})')
-    summary = ['### 네이버 RAW 5종 수집', f'기간: {since} ~ {until}',
-               '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만.',
+    summary = ['### 네이버 RAW 수집', f'기간: {since} ~ {until}',
+               '성별·연령: 쇼핑검색 최근 7일만. 검색어: 파워링크·쇼핑검색만. 키워드: 파워링크 등록 키워드(전환 포함).',
                '파워링크 검색어 전환수/매출/평균순위는 미제공(빈칸).',
                '| RAW | 성공 계정·날짜 | 행수 |', '|---|---:|---:|']
     summary += [f'| {r} | {len({s[:2] for s in scopes[r]})} | {len(result[r])} |' for r in selected]
