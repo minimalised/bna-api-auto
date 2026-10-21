@@ -2,9 +2,12 @@
 """Naver Search Ads 광고그룹 조회·설정 변경·소재 삭제.
 
 list       : 광고그룹 설정, 타게팅(매체·요일/시간대), 소재를 조회해 CSV/JSON으로 저장 (읽기 전용).
-update     : 지정 그룹의 이름·ON/OFF·입찰가·일예산·타게팅을 바꾼다.
+rename     : 광고그룹 이름만 바꾼다 (1개씩).
+media      : 매체 타게팅만 바꾼다.
+schedule   : 요일·시간대 타게팅만 바꾼다 (네이버는 요일과 시간대가 한 설정).
 delete-ads : 지정 소재를 삭제한다 (복구 불가).
-update/delete-ads는 기본이 미리보기(변경 전→후만 출력)이고, --apply를 줘야 실제 반영한 뒤
+한 번 실행에 한 가지 설정만 바꾸며, 반영 후 다시 조회해 그 설정 외 값이 그대로인지 확인한다.
+rename/media/schedule/delete-ads는 기본이 미리보기(변경 전→후만 출력)이고, --apply를 줘야 실제 반영한 뒤
 다시 조회해 결과를 확인한다. 인증·서명은 naver_report.Client를 그대로 쓴다.
 """
 import argparse
@@ -18,7 +21,6 @@ from pathlib import Path
 from naver_report import KST, TYPES, Client, Collector, env
 
 TARGET_TYPES = ('MEDIA_TARGET', 'TIME_WEEKLY_TARGET')
-LOCK = {'on': True, 'off': False}
 
 COLUMNS = ['계정ID', '캠페인ID', '캠페인', '캠페인 유형', '광고그룹ID', '광고그룹', '상태',
            'ON/OFF', '기본입찰가', '일예산 사용', '일예산', 'PC 입찰가중치', '모바일 입찰가중치', '수정시각']
@@ -123,121 +125,99 @@ def markdown(rows, cols):
     return '\n'.join(lines)
 
 
-def plan_changes(g, args):
-    """Return (fields, new_obj, diffs) for one ad group."""
-    new = dict(g)
-    fields, diffs = [], []
-
-    def change(field, key, value):
-        if g.get(key) != value:
-            new[key] = value
-            diffs.append((key, g.get(key), value))
-            if field not in fields:
-                fields.append(field)
-
-    if args.name:
-        change('', 'name', args.name)
-    if args.lock:
-        change('userLock', 'userLock', LOCK[args.lock])
-    if args.bid_amt is not None:
-        if args.bid_amt < 70 or args.bid_amt % 10:
-            raise ValueError('기본입찰가는 70원 이상, 10원 단위여야 합니다.')
-        change('bidAmt', 'bidAmt', args.bid_amt)
-    if args.daily_budget is not None:
-        if args.daily_budget == 'off':
-            change('budget', 'useDailyBudget', False)
-        else:
-            amount = int(args.daily_budget)
-            if amount < 50 or amount % 10:
-                raise ValueError('일예산은 50원 이상, 10원 단위여야 합니다.')
-            change('budget', 'useDailyBudget', True)
-            change('budget', 'dailyBudget', amount)
-    for item in args.set or []:
-        # 고급: --set fieldsName:key=JSON (API 문서의 fields 이름과 객체 키를 직접 지정)
-        try:
-            field, rest = item.split(':', 1)
-            key, raw = rest.split('=', 1)
-            value = json.loads(raw)
-        except ValueError:
-            raise ValueError(f'--set 형식 오류: {item} (예: budget:dailyBudget=30000)') from None
-        change(field, key, value)
-    return fields, new, diffs
+# 실행마다 바꾸는 값이 바뀌었는지, 그 외 값은 그대로인지 재조회로 확인할 때 무시하는 키
+VOLATILE = {'editTm', 'status', 'statusReason', 'delFlag'}
 
 
-def cmd_update(client, args):
-    ids = [x.strip() for x in args.ids.split(',') if x.strip()]
+def other_changes(before, after, key):
+    return [k for k in set(before) | set(after)
+            if k != key and k not in VOLATILE and before.get(k) != after.get(k)]
+
+
+def find_groups(client, raw):
+    ids = [x.strip() for x in raw.split(',') if x.strip()]
     if not ids:
-        raise ValueError('--ids에 광고그룹ID를 하나 이상 입력하세요.')
+        raise ValueError('광고그룹ID를 하나 이상 입력하세요.')
     found = {g['nccAdgroupId']: (cust, camp, g) for cust, camp, g in load_all(client)}
-    if args.name and len(ids) > 1:
-        raise ValueError('이름 변경은 광고그룹 1개씩만 할 수 있습니다.')
     missing = [i for i in ids if i not in found]
     if missing:
         raise ValueError(f'찾을 수 없는 광고그룹ID: {", ".join(missing)}')
-    target_new = {}
-    for item in args.target or []:
-        tp, _, raw = item.partition('=')
-        if tp not in TARGET_TYPES:
-            raise ValueError(f'--target 유형은 {", ".join(TARGET_TYPES)} 중 하나여야 합니다.')
-        try:
-            target_new[tp] = json.loads(raw)
-        except ValueError:
-            raise ValueError(f'--target {tp} 값이 JSON이 아닙니다.') from None
+    return [found[i] for i in ids]
+
+
+def cmd_rename(client, args):
+    """광고그룹 이름만 바꾼다."""
+    if not args.name.strip():
+        raise ValueError('새 이름을 입력하세요.')
+    if ',' in args.id:
+        raise ValueError('이름 변경은 광고그룹 1개씩만 할 수 있습니다.')
+    [(cust, camp, g)] = find_groups(client, args.id)
+    gid = g['nccAdgroupId']
+    print(f'[{camp.get("name", "")}] {gid}\n  이름: {g.get("name")} → {args.name}')
+    if g.get('name') == args.name:
+        print('\n이미 같은 이름입니다.')
+        return 0
+    if not args.apply:
+        print('\n미리보기만 했습니다. 실제 반영하려면 apply를 켜고 다시 실행하세요.')
+        return 0
+    # 방금 조회한 객체에서 이름만 바꿔 보내고, 다시 조회해 이름 외 값이 그대로인지 확인
+    client.request('PUT', f'/ncc/adgroups/{gid}', cust, body={**g, 'name': args.name})
+    after = client.get(f'/ncc/adgroups/{gid}', cust)
+    return verify(g, after, 'name', args.name, g.get('name'))
+
+
+def cmd_target(client, args):
+    """매체 또는 요일·시간대 타게팅 하나만 바꾼다."""
+    tp = {'media': 'MEDIA_TARGET', 'schedule': 'TIME_WEEKLY_TARGET'}[args.cmd]
+    try:
+        value = json.loads(args.target)
+    except ValueError:
+        raise ValueError('타게팅 값이 JSON이 아닙니다. list 결과 형식을 그대로 고쳐 넣어 주세요.') from None
     plans = []
-    for gid in ids:
-        cust, camp, g = found[gid]
-        fields, new, diffs = plan_changes(g, args)
-        tchanges = []
-        if target_new:
-            cur = targets(client, cust, gid)
-            for tp, value in target_new.items():
-                if tp not in cur:
-                    raise ValueError(f'{gid}에 {tp} 타게팅이 없습니다.')
-                if cur[tp].get('target') != value:
-                    tchanges.append((cur[tp], value))
-        plans.append((cust, camp, g, fields, new, diffs, tchanges))
-        print(f'\n[{camp.get("name", "")}] {g.get("name", "")} ({gid})')
-        if not diffs and not tchanges:
+    for cust, camp, g in find_groups(client, args.ids):
+        cur = targets(client, cust, g['nccAdgroupId'])
+        if tp not in cur:
+            raise ValueError(f'{g["nccAdgroupId"]}에 {tp} 타게팅이 없습니다.')
+        t = cur[tp]
+        print(f'\n[{camp.get("name", "")}] {g.get("name", "")} ({g["nccAdgroupId"]})')
+        if t.get('target') == value:
             print('  변경 없음 (이미 같은 값)')
-        for key, old, value in diffs:
-            print(f'  {key}: {old} → {value}')
-        for t, value in tchanges:
-            print(f'  {t["targetTp"]}: {json.dumps(t.get("target"), ensure_ascii=False)}')
-            print(f'    → {json.dumps(value, ensure_ascii=False)}')
-    todo = [p for p in plans if p[5] or p[6]]
-    if not todo:
+            continue
+        print(f'  {tp}: {json.dumps(t.get("target"), ensure_ascii=False)}')
+        print(f'    → {json.dumps(value, ensure_ascii=False)}')
+        plans.append((cust, g, cur))
+    if not plans:
         print('\n바꿀 내용이 없습니다.')
         return 0
     if not args.apply:
-        print(f'\n미리보기만 했습니다. 실제 반영하려면 apply를 켜고 다시 실행하세요. (대상 {len(todo)}개)')
+        print(f'\n미리보기만 했습니다. 실제 반영하려면 apply를 켜고 다시 실행하세요. (대상 {len(plans)}개)')
         return 0
     failed = 0
-    for cust, camp, g, fields, new, diffs, tchanges in todo:
-        gid = g['nccAdgroupId']
+    for cust, g, cur in plans:
+        t = cur[tp]
         try:
-            bad = []
-            if diffs:
-                # 이름 변경은 fields 없이 전체 객체 수정, 나머지는 해당 fields만 수정
-                params = {'fields': ','.join(f for f in fields if f)} if all(fields) else None
-                client.request('PUT', f'/ncc/adgroups/{gid}', cust, params=params, body=new)
-                after = client.get(f'/ncc/adgroups/{gid}', cust)
-                bad += [(k, v, after.get(k)) for k, _, v in diffs if after.get(k) != v]
-            for t, value in tchanges:
-                client.request('PUT', f'/ncc/targets/{t["nccTargetId"]}', cust, body={**t, 'target': value})
-            if tchanges:
-                cur = targets(client, cust, gid)
-                bad += [(t['targetTp'], v, (cur.get(t['targetTp']) or {}).get('target'))
-                        for t, v in tchanges if (cur.get(t['targetTp']) or {}).get('target') != v]
-            if bad:
-                failed += 1
-                print(f'[확인 실패] {g.get("name")} ({gid}): ' +
-                      ', '.join(f'{k} 기대 {v}, 실제 {a}' for k, v, a in bad))
-            else:
-                print(f'[반영 완료] {g.get("name")} ({gid})')
+            client.request('PUT', f'/ncc/targets/{t["nccTargetId"]}', cust, body={**t, 'target': value})
+            after = targets(client, cust, g['nccAdgroupId'])
+            before = {k: v.get('target') for k, v in cur.items()}
+            failed += verify(before, {k: v.get('target') for k, v in after.items()}, tp, value,
+                             t.get('target'), label=f'{g.get("name")} ({g["nccAdgroupId"]})')
         except Exception as e:
             failed += 1
-            print(f'[실패] {g.get("name")} ({gid}): {e}')
+            print(f'[실패] {g.get("name")} ({g["nccAdgroupId"]}): {e}')
     return 1 if failed else 0
+
+
+def verify(before, after, key, expected, old, label=None):
+    label = label or f'{after.get("name", "")} ({after.get("nccAdgroupId", "")})'
+    if after.get(key) != expected:
+        print(f'[확인 실패] {label}: {key} 기대 {expected}, 실제 {after.get(key)}')
+        return 1
+    extra = other_changes(before, after, key)
+    if extra:
+        print(f'[주의] {label}: {key} 외에 바뀐 값이 있습니다: {", ".join(sorted(extra))}')
+        return 1
+    print(f'[반영 완료] {label}: {key}만 변경됨')
+    return 0
 
 
 def cmd_delete_ads(client, args):
@@ -269,23 +249,23 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     sub.add_parser('list', help='광고그룹 현재 설정 조회')
-    u = sub.add_parser('update', help='광고그룹 설정 변경 (기본 미리보기)')
-    u.add_argument('--ids', required=True, help='광고그룹ID, 쉼표 구분')
-    u.add_argument('--name', help='새 광고그룹 이름')
-    u.add_argument('--target', action='append',
-                   help='타게팅 교체: MEDIA_TARGET=JSON 또는 TIME_WEEKLY_TARGET=JSON (list 결과 형식 그대로)')
-    u.add_argument('--lock', choices=['on', 'off'], help='on=그룹 OFF(일시중지), off=그룹 ON')
-    u.add_argument('--bid-amt', type=int, help='기본입찰가(원)')
-    u.add_argument('--daily-budget', help="일예산(원) 또는 'off'(제한 없음)")
-    u.add_argument('--set', action='append', help='고급: fields이름:키=JSON값')
-    u.add_argument('--apply', action='store_true', help='실제 반영 (없으면 미리보기)')
+    r = sub.add_parser('rename', help='광고그룹 이름만 변경 (기본 미리보기)')
+    r.add_argument('--id', required=True, help='광고그룹ID 1개')
+    r.add_argument('--name', required=True, help='새 광고그룹 이름')
+    r.add_argument('--apply', action='store_true', help='실제 반영 (없으면 미리보기)')
+    for cmd, what in (('media', '매체'), ('schedule', '요일·시간대')):
+        t = sub.add_parser(cmd, help=f'{what} 타게팅만 변경 (기본 미리보기)')
+        t.add_argument('--ids', required=True, help='광고그룹ID, 쉼표 구분')
+        t.add_argument('--target', required=True, help='새 타게팅 JSON (list 결과 형식 그대로)')
+        t.add_argument('--apply', action='store_true', help='실제 반영 (없으면 미리보기)')
     d = sub.add_parser('delete-ads', help='소재 삭제 (기본 미리보기, 복구 불가)')
     d.add_argument('--ad-ids', required=True, help='소재ID, 쉼표 구분')
     d.add_argument('--customer', help='계정ID (기본: NAVER_CUSTOMER_IDS 첫 번째)')
     d.add_argument('--apply', action='store_true', help='실제 삭제 (없으면 미리보기)')
     args = p.parse_args()
     client = Client()
-    return {'list': cmd_list, 'update': cmd_update, 'delete-ads': cmd_delete_ads}[args.cmd](client, args)
+    return {'list': cmd_list, 'rename': cmd_rename, 'media': cmd_target,
+            'schedule': cmd_target, 'delete-ads': cmd_delete_ads}[args.cmd](client, args)
 
 
 if __name__ == '__main__':

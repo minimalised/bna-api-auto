@@ -1,28 +1,20 @@
 name: Naver AdGroup Settings
 
-# 수동 실행 전용. list는 읽기 전용, update/delete-ads는 apply를 켜야만 실제 반영.
+# 수동 실행 전용. 한 번 실행에 한 가지만 바꾼다. list는 읽기 전용, 나머지는 apply를 켜야만 실제 반영.
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: "list=현황 조회, update=그룹 설정 변경, delete-ads=소재 삭제(복구 불가)"
+        description: "list=현황 조회, rename=이름, media=매체, schedule=요일·시간대, delete-ads=소재 삭제(복구 불가)"
         type: choice
-        options: [list, update, delete-ads]
+        options: [list, rename, media, schedule, delete-ads]
         default: list
       adgroup_ids:
-        description: "update: 광고그룹ID (쉼표 구분)"
+        description: "rename/media/schedule: 광고그룹ID (rename은 1개, 나머지는 쉼표 구분)"
         type: string
         required: false
-      name:
-        description: "update: 새 광고그룹 이름 (그룹 1개일 때만)"
-        type: string
-        required: false
-      media_target:
-        description: "update: 매체 타게팅 JSON (list 결과 형식)"
-        type: string
-        required: false
-      time_weekly_target:
-        description: "update: 요일·시간대 타게팅 JSON (list 결과 형식)"
+      value:
+        description: "rename=새 이름, media/schedule=새 타게팅 JSON (list 결과 형식)"
         type: string
         required: false
       ad_ids:
@@ -63,19 +55,16 @@ jobs:
           NAVER_CUSTOMER_IDS: ${{ secrets.NAVER_CUSTOMER_IDS }}
           IN_ACTION: ${{ inputs.action }}
           IN_IDS: ${{ inputs.adgroup_ids }}
-          IN_NAME: ${{ inputs.name }}
-          IN_MEDIA: ${{ inputs.media_target }}
-          IN_TIME: ${{ inputs.time_weekly_target }}
+          IN_VALUE: ${{ inputs.value }}
           IN_AD_IDS: ${{ inputs.ad_ids }}
           IN_APPLY: ${{ inputs.apply }}
         run: |
           set -euo pipefail
           ARGS=("$IN_ACTION")
-          if [[ "$IN_ACTION" == "update" ]]; then
-            ARGS+=(--ids "$IN_IDS")
-            [[ -n "$IN_NAME" ]] && ARGS+=(--name "$IN_NAME")
-            [[ -n "$IN_MEDIA" ]] && ARGS+=(--target "MEDIA_TARGET=$IN_MEDIA")
-            [[ -n "$IN_TIME" ]] && ARGS+=(--target "TIME_WEEKLY_TARGET=$IN_TIME")
+          if [[ "$IN_ACTION" == "rename" ]]; then
+            ARGS+=(--id "$IN_IDS" --name "$IN_VALUE")
+          elif [[ "$IN_ACTION" == "media" || "$IN_ACTION" == "schedule" ]]; then
+            ARGS+=(--ids "$IN_IDS" --target "$IN_VALUE")
           elif [[ "$IN_ACTION" == "delete-ads" ]]; then
             ARGS+=(--ad-ids "$IN_AD_IDS")
           fi
