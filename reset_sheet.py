@@ -2,7 +2,7 @@
 """
 리포트 탭 초기화 (백필 전 1회용). 지우기 전에 각 탭을 CSV로 reports/에 백업합니다.
 
-대상: 메타·구글 RAW·성별연령기기 탭, 네이버 RAW 5종, 통합 탭. 그 밖의 탭은 건드리지 않습니다.
+대상: 메타·구글 RAW·성별연령기기·검색어 탭, 네이버 RAW 6종, 통합 탭. 그 밖의 탭은 건드리지 않습니다.
 탭 자체는 남기고 내용만 지우므로, 다른 탭의 수식 참조(#REF!)가 깨지지 않습니다.
 
 환경변수: GCP_SA_KEY, SHEET_ID (+ 매체 스크립트와 같은 탭 이름 설정)
@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
-NAVER_REPORTS = ("campaign", "search", "media", "gender", "age")
+NAVER_REPORTS = ("campaign", "search", "keyword", "media", "gender", "age")
 
 
 def env(name, default=None):
@@ -32,7 +32,8 @@ def target_tabs():
     naver = env("NAVER_RAW_PREFIX", "naver_raw")
     prefix = env("REPORT_TAB_PREFIX", "통합")
     return ([env("SHEET_TAB", "meta_daily"), env("GOOGLE_SHEET_TAB", "google_daily"),
-             env("META_BREAKDOWN_TAB", "meta_breakdown"), env("GOOGLE_BREAKDOWN_TAB", "google_breakdown")]
+             env("META_BREAKDOWN_TAB", "meta_breakdown"), env("GOOGLE_BREAKDOWN_TAB", "google_breakdown"),
+             env("GOOGLE_SEARCH_TERM_TAB", "google_search_terms")]
             + [f"{naver}_{r}" for r in NAVER_REPORTS]
             + [f"{prefix}_{p}" for p in ("일별", "주간", "월간")])
 

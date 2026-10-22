@@ -22,12 +22,13 @@ on:
           - "14"
         default: "1"
       reports:
-        description: "수집 RAW (all=5종, 지원 범위는 Python 안내 참고)"
+        description: "수집 RAW (all=6종, 지원 범위는 Python 안내 참고)"
         type: choice
         options:
           - all
           - campaign
           - search
+          - keyword
           - media
           - gender
           - age

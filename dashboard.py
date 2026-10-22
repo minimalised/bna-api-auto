@@ -7,6 +7,7 @@
   4. 요일별             : 최근 4주 요일별 일평균과 ROAS
   5. 성별·연령          : 최근 30일 (메타·구글. 네이버 검색광고는 API 미제공)
   6. PC/모바일          : 최근 30일 매체별 기기 비중과 성과
+  7. 검색어 효율        : 최근 30일 파워링크(등록 키워드)·쇼핑검색·구글 검색광고 검색어를 고효율·보통·저효율로
 
 수식 없이 값만 씁니다. 탭은 유지(링크 그대로)하고 값·서식·병합·조건부서식·차트만 지운 뒤 다시 그립니다.
 """
@@ -25,6 +26,10 @@ GENDER_ORDER = ["여성", "남성", "알수없음"]
 DEVICE_ORDER = ["모바일", "PC", "태블릿", "TV", "기타"]
 TREND_THRESHOLD = 0.10  # 최근7일 ROAS가 직전7일 대비 ±10% 이상이면 ▲/▼
 CHANGE_THRESHOLD = 0.05  # 증감 색칠 기준 ±5%
+TERM_PRODUCTS = ["파워링크", "쇼핑검색", "구글 검색광고"]
+TERM_TIERS = ["고효율", "보통", "저효율"]
+TERM_LOW_RATIO = 0.5  # 상품 평균 ROAS의 50% 미만(전환 없음 포함)이면 저효율
+TERM_TOP_N = 10  # 등급마다 비용 상위 몇 개를 보여줄지
 COLS = 15  # 핵심 지표 카드 4개 × (3열 + 간격 1열) − 마지막 간격
 
 FORMATS = {"won": "#,##0", "int": "#,##0", "dec": "#,##0.0", "pct": "0%", "pct2": "0.00%",
@@ -179,7 +184,16 @@ class Sheet:
         self.charts.append({"spec": spec, "row": row, "col": col, "w": width, "h": height})
 
 
-def build(rows, breakdown, basis_note, updated_at):
+def term_tier(roas, avg):
+    """상품 평균 ROAS 이상 고효율, 평균의 TERM_LOW_RATIO 이상 보통, 그 밖(전환 없음 포함) 저효율."""
+    if roas == "" or not roas:
+        return "저효율"
+    if avg and roas >= avg:
+        return "고효율"
+    return "보통" if avg and roas >= avg * TERM_LOW_RATIO else "저효율"
+
+
+def build(rows, breakdown, basis_note, updated_at, terms=()):
     by_day = defaultdict(zero)
     by_media_day = defaultdict(lambda: defaultdict(zero))
     by_prod = defaultdict(lambda: defaultdict(zero))
@@ -399,6 +413,82 @@ def build(rows, breakdown, basis_note, updated_at):
         s.table(["매체", "기기", "비용", "매체 내 비중", "전환매출", "ROAS", "전환수", "CPA", "CTR", "전환율"], body,
                 [None, None, "won", "pct", "won", "pct", "dec", "won", "pct2", "pct2"],
                 heat={3: HEAT["cost"], 5: HEAT["rate"]})
+
+    # 7. 검색어 효율: 상품별로 검색어를 합친 뒤 상품 평균 ROAS와 비교해 등급을 매김
+    by_term = defaultdict(zero)
+    camps = defaultdict(lambda: defaultdict(float))
+    for r in terms:
+        if r["날짜"] in last30_set:
+            k = (r["상품"], r["검색어"])
+            add(by_term[k], r)
+            camps[k][r["캠페인"]] += r["광고비"]
+    by_term = {k: t for k, t in by_term.items() if t["광고비"] > 0}
+    low = f"{TERM_LOW_RATIO:.0%}"
+    s.section("7. 검색어 효율 (최근 30일)",
+              f"상품 평균 ROAS 이상 = 고효율 · 평균의 {low} 이상 = 보통 · 평균의 {low} 미만(전환 없음 포함) = 저효율 · "
+              "비용이 있는 검색어만 · 파워링크는 검색어별 전환을 API가 주지 않아 등록 키워드 기준")
+    products = [p for p in TERM_PRODUCTS if any(k[0] == p for k in by_term)]
+    if not products:
+        s.put(s.row, 0, "검색어 데이터 없음 (아직 수집 전)")
+        s.style(s.row, 0, 1, 1, "note")
+        return s
+    tier_bg = {"고효율": GOOD_BG, "저효율": BAD_BG}
+    graded = {}
+    for p in products:
+        p_total = zero()
+        for (prod, _), t in by_term.items():
+            if prod == p:
+                add(p_total, t)
+        avg = div(p_total["전환매출"], p_total["광고비"])
+        graded[p] = (p_total, avg, sorted(
+            ((term_tier(div(t["전환매출"], t["광고비"]), avg), text, t)
+             for (prod, text), t in by_term.items() if prod == p),
+            key=lambda x: (TERM_TIERS.index(x[0]), -x[2]["광고비"], x[1])))
+
+    s.sub("7-1. 등급별 요약")
+    body, colors = [], {}
+    for p in products:
+        p_total, avg, items = graded[p]
+        for tier in TERM_TIERS:
+            t, n = zero(), 0
+            for g, _, v in items:
+                if g == tier:
+                    add(t, v)
+                    n += 1
+            colors[(len(body), 1)] = tier_bg.get(tier)
+            body.append([p, tier, n, t["광고비"], div(t["광고비"], p_total["광고비"]), t["전환매출"],
+                         div(t["전환매출"], p_total["전환매출"]), div(t["전환매출"], t["광고비"]), t["전환수"],
+                         div(t["광고비"], t["전환수"])])
+    top, n = s.table(["상품", "등급", "검색어 수", "비용", "비용 비중", "전환매출", "매출 비중", "ROAS", "전환수", "CPA"],
+                     body, [None, None, "int", "won", "pct", "won", "pct", "pct", "dec", "won"],
+                     colors={k: v for k, v in colors.items() if v})
+    s.style(top + 1, 1, n, 1, "center")
+    s.row += 1
+
+    for i, p in enumerate(products, start=2):
+        p_total, avg, items = graded[p]
+        label = "키워드" if p == "파워링크" else "검색어"
+        s.sub(f"7-{i}. {p} · 평균 ROAS {avg:.0%} · 등급마다 비용 상위 {TERM_TOP_N}개" if avg != ""
+              else f"7-{i}. {p} · 전환 없음 · 비용 상위 {TERM_TOP_N}개")
+        body, colors, shown = [], {}, defaultdict(int)
+        for tier, text, t in items:
+            if shown[tier] >= TERM_TOP_N:
+                continue
+            shown[tier] += 1
+            camp = max(camps[(p, text)].items(), key=lambda x: x[1])[0]
+            if len(camps[(p, text)]) > 1:
+                camp += f" 외 {len(camps[(p, text)]) - 1}"
+            if tier in tier_bg:
+                colors[(len(body), 0)] = tier_bg[tier]
+            body.append([tier, text, camp, t["광고비"], div(t["광고비"], p_total["광고비"]), t["클릭수"],
+                         div(t["클릭수"], t["노출수"]), div(t["광고비"], t["클릭수"]), t["전환수"], t["전환매출"],
+                         div(t["전환매출"], t["광고비"]), div(t["광고비"], t["전환수"])])
+        top, n = s.table(["등급", label, "캠페인", "비용", "비용 비중", "클릭수", "CTR", "CPC", "전환수", "전환매출",
+                          "ROAS", "CPA"], body,
+                         [None, None, None, "won", "pct", "int", "pct2", "won", "dec", "won", "pct", "won"],
+                         colors=colors)
+        s.style(top + 1, 0, n, 1, "center")
+        s.row += 1
     return s
 
 
