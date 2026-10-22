@@ -17,7 +17,10 @@ from datetime import date, timedelta
 
 SUMS = ["광고비", "노출수", "클릭수", "전환수", "전환매출"]
 MEDIA_LABEL = {"Meta": "메타", "Google": "구글", "Naver SA": "네이버검색"}
-MEDIA_ORDER = ["메타", "구글", "네이버검색"]
+MEDIA_ORDER = ["메타", "네이버검색", "구글"]
+# 매체별 표의 상품 순서 (사용자 지정). 목록에 없는 상품은 같은 매체 맨 뒤에 비용 큰 순
+PRODUCT_ORDER = {"메타": ["메타"], "네이버검색": ["브랜드검색", "쇼핑검색", "파워링크"],
+                 "구글": ["실적최대화", "디맨드젠", "검색광고"]}
 GOOGLE_PRODUCT = {"SEARCH": "검색광고", "PERFORMANCE_MAX": "실적최대화", "DEMAND_GEN": "디맨드젠",
                   "DISPLAY": "디스플레이", "VIDEO": "동영상", "SHOPPING": "쇼핑"}
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -26,7 +29,7 @@ GENDER_ORDER = ["여성", "남성", "알수없음"]
 DEVICE_ORDER = ["모바일", "PC", "태블릿", "TV", "기타"]
 TREND_THRESHOLD = 0.10  # 최근7일 ROAS가 직전7일 대비 ±10% 이상이면 ▲/▼
 CHANGE_THRESHOLD = 0.05  # 증감 색칠 기준 ±5%
-TERM_PRODUCTS = ["파워링크", "쇼핑검색", "구글 검색광고"]
+TERM_PRODUCTS = ["쇼핑검색", "파워링크", "구글 검색광고"]
 TERM_TIERS = ["고효율", "보통", "저효율"]
 TERM_LOW_RATIO = 0.5  # 상품 평균 ROAS의 50% 미만(전환 없음 포함)이면 저효율
 TERM_TOP_N = 10  # 등급마다 비용 상위 몇 개를 보여줄지
@@ -245,7 +248,12 @@ def build(rows, breakdown, basis_note, updated_at, terms=()):
 
     # 2. 매체별 성과
     s.section("2. 매체별 성과", "증감액 = 기준 기간 − 비교 기간 · ROAS 증감은 %p")
-    prods = sorted(by_prod, key=lambda k: (-total(by_prod[k], recent)["광고비"], k))
+    def prod_rank(k):
+        media, prod = k
+        order = PRODUCT_ORDER.get(media, [])
+        return (MEDIA_ORDER.index(media) if media in MEDIA_ORDER else 99,
+                order.index(prod) if prod in order else 99, -total(by_prod[k], recent)["광고비"], prod)
+    prods = sorted(by_prod, key=prod_rank)
     rows_src = [(m, p, by_prod[(m, p)]) for m, p in prods] + [("합계", "", by_day)]
 
     # 2-1. 기준일 vs 전일·전주 같은 요일

@@ -41,7 +41,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
-MEDIA_ORDER = ["Meta", "Google", "Naver SA"]
+MEDIA_ORDER = ["Meta", "Naver SA", "Google"]
 SUMS = ["광고비", "노출수", "클릭수", "전환수", "전환매출"]
 VAT = 1.1
 
