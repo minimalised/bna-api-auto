@@ -22,6 +22,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
+# 네이버 매체 마스터에 128KB가 넘는 칸이 들어오는 날이 있어 csv 기본 한도를 풂 (2026-10-21)
+csv.field_size_limit(sys.maxsize)
 
 
 class Unsupported(ValueError):
