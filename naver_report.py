@@ -346,7 +346,14 @@ class Collector:
     def load_media(self):
         if self.media is not None:
             return
-        raw = self.client.job(self.customer, item='Media')
+        try:
+            raw = self.client.job(self.customer, item='Media')
+        except RuntimeError as e:
+            # 2026-11-07부터 Media 마스터 요청이 HTTP 400으로 거절됨. 기기(PC/모바일) 분리는
+            # 마스터 없이도 가능하므로 검색/콘텐츠 분류만 비우고 보고서는 계속 적재한다.
+            print(f'*** Media 마스터 조회 실패, 검색/콘텐츠 분류 없이 진행: {e}', flush=True)
+            self.media = {}
+            return
         media = {}
         for n, c in enumerate(csv.reader(io.StringIO(table_bytes(raw)), delimiter='\t'), 1):
             if not c or all(v == '' for v in c):
