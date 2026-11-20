@@ -1,0 +1,83 @@
+name: Naver AdGroup Settings
+
+# 수동 실행 전용. 한 번 실행에 한 가지만 바꾼다. list는 읽기 전용, 나머지는 apply를 켜야만 실제 반영.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "list=현황 조회, rename=이름, media=매체, schedule=요일·시간대, delete-ads=소재 삭제(복구 불가)"
+        type: choice
+        options: [list, rename, media, schedule, delete-ads]
+        default: list
+      adgroup_ids:
+        description: "rename/media/schedule: 광고그룹ID (rename은 1개, 나머지는 쉼표 구분)"
+        type: string
+        required: false
+      value:
+        description: "rename=새 이름, media/schedule=새 타게팅 JSON (list 결과 형식)"
+        type: string
+        required: false
+      ad_ids:
+        description: "delete-ads: 소재ID (쉼표 구분)"
+        type: string
+        required: false
+      apply:
+        description: "실제 반영 (끄면 변경 전→후 미리보기만)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: naver-adgroup
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run
+        env:
+          NAVER_API_KEY: ${{ secrets.NAVER_API_KEY }}
+          NAVER_SECRET_KEY: ${{ secrets.NAVER_SECRET_KEY }}
+          NAVER_CUSTOMER_ID: ${{ secrets.NAVER_CUSTOMER_ID }}
+          NAVER_CUSTOMER_IDS: ${{ secrets.NAVER_CUSTOMER_IDS }}
+          IN_ACTION: ${{ inputs.action }}
+          IN_IDS: ${{ inputs.adgroup_ids }}
+          IN_VALUE: ${{ inputs.value }}
+          IN_AD_IDS: ${{ inputs.ad_ids }}
+          IN_APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          ARGS=("$IN_ACTION")
+          if [[ "$IN_ACTION" == "rename" ]]; then
+            ARGS+=(--id "$IN_IDS" --name "$IN_VALUE")
+          elif [[ "$IN_ACTION" == "media" || "$IN_ACTION" == "schedule" ]]; then
+            ARGS+=(--ids "$IN_IDS" --target "$IN_VALUE")
+          elif [[ "$IN_ACTION" == "delete-ads" ]]; then
+            ARGS+=(--ad-ids "$IN_AD_IDS")
+          fi
+          if [[ "$IN_ACTION" != "list" && "$IN_APPLY" == "true" ]]; then
+            ARGS+=(--apply)
+          fi
+          python naver_adgroup.py "${ARGS[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: naver-adgroup-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore

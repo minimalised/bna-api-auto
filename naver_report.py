@@ -147,7 +147,7 @@ class Client:
             try:
                 with urllib.request.urlopen(req, timeout=60) as response:
                     content = response.read()
-                return content if raw_url else json.loads(content)
+                return content if raw_url else (json.loads(content) if content else None)
             except urllib.error.HTTPError as e:
                 status = e.code
                 code = ''
